@@ -1,0 +1,11 @@
+# Build output
+/bin/
+*.test
+coverage.out
+
+# Local config and secrets
+.env
+rclone.conf
+
+# OS
+.DS_Store
