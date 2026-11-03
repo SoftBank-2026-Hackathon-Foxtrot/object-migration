@@ -8,7 +8,7 @@ Design: [architecture](https://softbank-2026-hackathon-foxtrot.github.io/design-
 
 ## Status
 
-Skeleton only. The HTTP server exposes `GET /healthz`.
+Early. The HTTP server exposes `GET /healthz`. Migration types, phase rules, and an in-memory store are in place; the common API and the worker are next.
 
 ## Run
 
@@ -31,5 +31,7 @@ go test ./...
 | --- | --- |
 | `cmd/object-migration` | Entry point |
 | `internal/api` | HTTP API |
+| `internal/migration` | Migration types, phases, and which commands each phase accepts. No I/O |
+| `internal/store` | Storage shared by the API and the worker. In-memory for now |
 
-Planned packages: `internal/runner` (migration phases), `internal/eventsource` (SQS, Pub/Sub, SeaweedFS change feeds), `internal/copier` (rclone).
+Planned packages: `internal/worker` (runs phases), `internal/eventsource` (SQS, Pub/Sub, SeaweedFS change feeds), `internal/copier` (rclone), `internal/routing` (active bucket for app servers).
