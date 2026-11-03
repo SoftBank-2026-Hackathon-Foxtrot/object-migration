@@ -94,8 +94,8 @@ func TestFullFlow(t *testing.T) {
 	w.Notify(m.ID)
 
 	ready := waitPhase(t, s, m.ID, migration.PhaseReady)
-	if ready.Progress.Done != 10 || !ready.Readiness.Ready {
-		t.Fatalf("at READY: progress=%+v readiness=%+v", ready.Progress, ready.Readiness)
+	if ready.Replication.InitialCopy.Completed != 10 || ready.Readiness.Cutover.Result != migration.ResultPass {
+		t.Fatalf("at READY: initialCopy=%+v cutover=%+v", ready.Replication.InitialCopy, ready.Readiness.Cutover)
 	}
 
 	command(t, w, s, m.ID, migration.CommandFreeze)
@@ -138,7 +138,11 @@ func TestAbortWhileSyncing(t *testing.T) {
 
 	waitPhase(t, s, m.ID, migration.PhaseSyncing)
 	command(t, w, s, m.ID, migration.CommandAbort)
-	waitPhase(t, s, m.ID, migration.PhaseAborted)
+	aborted := waitPhase(t, s, m.ID, migration.PhaseAborted)
+	// Only the direction that ran is stopped; reverse never started.
+	if aborted.Replication.Forward.State != migration.FlowStopped || aborted.Replication.Reverse.State != migration.FlowOff {
+		t.Fatalf("replication = %+v", aborted.Replication)
+	}
 }
 
 // flaky fails InitialSync a fixed number of times, then behaves like Fake.
@@ -218,7 +222,7 @@ type gated struct {
 	release chan struct{}
 }
 
-func (g *gated) Sync(ctx context.Context, m migration.Migration) (migration.Readiness, migration.Lag, error) {
+func (g *gated) Sync(ctx context.Context, m migration.Migration) (engine.SyncReport, error) {
 	if !g.gate.Load() {
 		return g.Fake.Sync(ctx, m)
 	}
@@ -226,9 +230,9 @@ func (g *gated) Sync(ctx context.Context, m migration.Migration) (migration.Read
 	select {
 	case <-g.release:
 	case <-ctx.Done():
-		return migration.Readiness{}, migration.Lag{}, ctx.Err()
+		return engine.SyncReport{}, ctx.Err()
 	}
-	return migration.Readiness{Ready: false}, migration.Lag{Seconds: 5}, nil
+	return engine.SyncReport{Cutover: migration.Decide(migration.Check{Name: "lag_stable", OK: false}), LagSeconds: 5}, nil
 }
 
 func TestPendingCommandKeepsPhase(t *testing.T) {
@@ -263,16 +267,19 @@ type scripted struct {
 
 func newScripted() *scripted { return &scripted{Fake: engine.NewFake(time.Millisecond)} }
 
-func (s *scripted) Sync(ctx context.Context, m migration.Migration) (migration.Readiness, migration.Lag, error) {
+func (s *scripted) Sync(ctx context.Context, m migration.Migration) (engine.SyncReport, error) {
 	if s.notReady.Load() {
-		return migration.Readiness{Ready: false, Checks: []migration.Check{{Name: "lag_stable", OK: false}}}, migration.Lag{Seconds: 9}, nil
+		return engine.SyncReport{Cutover: migration.Decide(migration.Check{Name: "lag_stable", OK: false}), Backlog: 40, LagSeconds: 9}, nil
 	}
 	return s.Fake.Sync(ctx, m)
 }
 
-func (s *scripted) Verify(ctx context.Context, m migration.Migration) (migration.Readiness, error) {
+func (s *scripted) Verify(ctx context.Context, m migration.Migration) (engine.VerifyReport, error) {
 	if s.notReady.Load() {
-		return migration.Readiness{Ready: false, Checks: []migration.Check{{Name: "diff", OK: false, Message: "3 objects differ"}}}, nil
+		return engine.VerifyReport{
+			Advance:  migration.Decide(migration.Check{Name: "diff", OK: false, Message: "3 objects differ"}),
+			Rollback: migration.Decide(migration.Check{Name: "reverse_sync", OK: true}),
+		}, nil
 	}
 	return s.Fake.Verify(ctx, m)
 }
@@ -322,8 +329,9 @@ func TestReadinessCanDropBackToSyncing(t *testing.T) {
 
 	e.notReady.Store(true)
 	syncing := waitPhase(t, s, m.ID, migration.PhaseSyncing)
-	if syncing.State != migration.StateRunning || syncing.Readiness.Ready || syncing.Lag.Seconds != 9 {
-		t.Fatalf("state=%s readiness=%+v lag=%+v", syncing.State, syncing.Readiness, syncing.Lag)
+	fwd := syncing.Replication.Forward
+	if syncing.State != migration.StateRunning || syncing.Readiness.Cutover.Result != migration.ResultFail || fwd.LagSeconds != 9 || fwd.Backlog != 40 {
+		t.Fatalf("state=%s cutover=%+v forward=%+v", syncing.State, syncing.Readiness.Cutover, fwd)
 	}
 	e.notReady.Store(false)
 	waitPhase(t, s, m.ID, migration.PhaseReady)
@@ -340,7 +348,7 @@ func TestFinalizeWaitsForVerification(t *testing.T) {
 	e.notReady.Store(true)
 	command(t, w, s, m.ID, migration.CommandResume)
 	waitFor(t, s, m.ID, "failed verification", func(m migration.Migration) bool {
-		return m.Phase == migration.PhaseVerifying && len(m.Readiness.Checks) > 0 && !m.Readiness.Checks[0].OK
+		return m.Phase == migration.PhaseVerifying && m.Readiness.Advance.Result == migration.ResultFail
 	})
 	req := migration.CommandRequest{Command: migration.CommandFinalize, RequestedAt: time.Now()}
 	if _, err := s.RequestCommand(context.Background(), m.ID, req); !errors.Is(err, migration.ErrPrecondition) {
@@ -404,4 +412,69 @@ func TestVersionConflictsAreRetried(t *testing.T) {
 	if left := s.n.Load(); left > 0 {
 		t.Fatalf("%d forced conflicts were never hit", left)
 	}
+}
+
+// slowResume holds Resume until released, so a test can look at the status
+// while the forward sync drains.
+type slowResume struct {
+	*engine.Fake
+	release chan struct{}
+}
+
+func (e *slowResume) Resume(ctx context.Context, _ migration.Migration) error {
+	select {
+	case <-e.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestReplicationStatesFollowTheFlow(t *testing.T) {
+	s := store.NewMemory()
+	e := &slowResume{Fake: engine.NewFake(50 * time.Millisecond), release: make(chan struct{})}
+	w, _ := start(t, s, e)
+	m := create(t, s)
+	w.Notify(m.ID)
+
+	flows := func(m migration.Migration) (migration.FlowState, migration.FlowState) {
+		return m.Replication.Forward.State, m.Replication.Reverse.State
+	}
+	want := func(m migration.Migration, fwd, rev migration.FlowState) {
+		t.Helper()
+		if f, r := flows(m); f != fwd || r != rev {
+			t.Fatalf("phase %s: forward=%s reverse=%s, want %s/%s", m.Phase, f, r, fwd, rev)
+		}
+	}
+
+	copying := waitPhase(t, s, m.ID, migration.PhaseInitialSync)
+	want(copying, migration.FlowInitialCopy, migration.FlowOff)
+
+	want(waitPhase(t, s, m.ID, migration.PhaseSyncing), migration.FlowStreaming, migration.FlowOff)
+	want(toFrozenFrom(t, w, s, m.ID), migration.FlowStreaming, migration.FlowOff)
+	command(t, w, s, m.ID, migration.CommandSwitch)
+	want(waitPhase(t, s, m.ID, migration.PhaseSwitched), migration.FlowStreaming, migration.FlowOff)
+
+	command(t, w, s, m.ID, migration.CommandResume)
+	draining := waitFor(t, s, m.ID, "draining", func(m migration.Migration) bool {
+		return m.Replication.Forward.State == migration.FlowDraining
+	})
+	want(draining, migration.FlowDraining, migration.FlowOff)
+	close(e.release)
+
+	verified := waitFor(t, s, m.ID, "verified", func(m migration.Migration) bool {
+		return m.Phase == migration.PhaseVerifying && m.State == migration.StateSucceeded
+	})
+	want(verified, migration.FlowStopped, migration.FlowStreaming)
+
+	command(t, w, s, m.ID, migration.CommandFinalize)
+	want(waitPhase(t, s, m.ID, migration.PhaseCompleted), migration.FlowStopped, migration.FlowStopped)
+}
+
+// toFrozenFrom waits for an existing migration to be ready and freezes it.
+func toFrozenFrom(t *testing.T, w *Worker, s store.Store, id string) migration.Migration {
+	t.Helper()
+	waitPhase(t, s, id, migration.PhaseReady)
+	command(t, w, s, id, migration.CommandFreeze)
+	return waitPhase(t, s, id, migration.PhaseFrozen)
 }

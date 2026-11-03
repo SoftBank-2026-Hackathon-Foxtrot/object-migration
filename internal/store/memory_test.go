@@ -142,9 +142,9 @@ func TestListActiveSkipsTerminal(t *testing.T) {
 func TestReturnedCopiesAreIsolated(t *testing.T) {
 	s := NewMemory()
 	m := create(t, s)
-	m.Readiness.Checks = append(m.Readiness.Checks, migration.Check{Name: "x"})
+	m.Readiness.Rollback.Checks[0].OK = false
 	got, _ := s.Get(ctx, m.ID)
-	if len(got.Readiness.Checks) != 0 {
+	if !got.Readiness.Rollback.Checks[0].OK {
 		t.Fatal("caller's change leaked into the store")
 	}
 }

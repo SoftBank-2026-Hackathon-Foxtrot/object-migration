@@ -42,6 +42,8 @@ func toAPIError(err error) *apiError {
 		return &apiError{Code: "INVALID_PHASE", Message: err.Error(), status: http.StatusConflict}
 	case errors.Is(err, migration.ErrCommandPending):
 		return &apiError{Code: "COMMAND_PENDING", Message: err.Error(), Retryable: true, status: http.StatusConflict}
+	case errors.Is(err, migration.ErrVersionMismatch):
+		return &apiError{Code: "VERSION_CONFLICT", Message: err.Error(), status: http.StatusConflict}
 	case errors.Is(err, migration.ErrPrecondition):
 		return &apiError{Code: "PRECONDITION_FAILED", Message: err.Error(), Retryable: true, status: http.StatusConflict}
 	}

@@ -178,13 +178,14 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 	switch m.Phase {
 	case migration.PhaseCreated:
 		return 0, w.mutate(ctx, m.ID, func(x *migration.Migration) error {
+			x.Replication.Forward.State = migration.FlowInitialCopy
 			return w.enter(x, migration.PhaseInitialSync, migration.StateRunning)
 		})
 
 	case migration.PhaseInitialSync:
 		report := func(p migration.Progress) {
 			err := w.mutate(ctx, m.ID, func(x *migration.Migration) error {
-				x.Progress = p
+				x.Replication.InitialCopy = p
 				return nil
 			})
 			if err != nil && ctx.Err() == nil {
@@ -196,11 +197,12 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 		}
 		return 0, w.mutate(ctx, m.ID, func(x *migration.Migration) error {
 			x.LastError = nil
+			x.Replication.Forward.State = migration.FlowStreaming
 			return w.enter(x, migration.PhaseSyncing, migration.StateRunning)
 		})
 
 	case migration.PhaseSyncing, migration.PhaseReady:
-		readiness, lag, err := w.engine.Sync(ctx, m)
+		report, err := w.engine.Sync(ctx, m)
 		if err != nil {
 			return 0, err
 		}
@@ -208,14 +210,17 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 			if x.Phase != migration.PhaseSyncing && x.Phase != migration.PhaseReady {
 				return nil // a command moved it on while we synced
 			}
-			x.Readiness, x.Lag, x.LastError = readiness, lag, nil
+			x.Readiness.Cutover, x.LastError = report.Cutover, nil
+			x.Replication.Forward.Backlog = report.Backlog
+			x.Replication.Forward.LagSeconds = report.LagSeconds
 			if x.Pending != nil {
 				return nil // keep the phase the pending command was accepted in
 			}
+			ready := report.Cutover.Result == migration.ResultPass
 			switch {
-			case readiness.Ready && x.Phase == migration.PhaseSyncing:
+			case ready && x.Phase == migration.PhaseSyncing:
 				return w.enter(x, migration.PhaseReady, migration.StateWaiting)
-			case !readiness.Ready && x.Phase == migration.PhaseReady:
+			case !ready && x.Phase == migration.PhaseReady:
 				return w.enter(x, migration.PhaseSyncing, migration.StateRunning)
 			}
 			return nil
@@ -231,7 +236,7 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 		if m.State == migration.StateSucceeded {
 			return w.cfg.PollInterval, nil // verified; waiting for finalize or rollback
 		}
-		readiness, err := w.engine.Verify(ctx, m)
+		report, err := w.engine.Verify(ctx, m)
 		if err != nil {
 			return 0, err
 		}
@@ -239,8 +244,10 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 			if x.Phase != migration.PhaseVerifying {
 				return nil
 			}
-			x.Readiness, x.LastError = readiness, nil
-			if readiness.Ready {
+			x.Readiness.Advance, x.Readiness.Rollback, x.LastError = report.Advance, report.Rollback, nil
+			x.Replication.Reverse.Backlog = report.ReverseBacklog
+			x.Replication.Reverse.LagSeconds = report.ReverseLagSeconds
+			if report.Advance.Result == migration.ResultPass {
 				x.State = migration.StateSucceeded
 			}
 			return nil
@@ -253,6 +260,7 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 		}
 		return 0, w.mutate(ctx, m.ID, func(x *migration.Migration) error {
 			x.LastError = nil
+			stopFlows(x)
 			return w.enter(x, migration.PhaseRolledBack, migration.StateSucceeded)
 		})
 	}
@@ -268,6 +276,9 @@ func (w *Worker) runCommand(ctx context.Context, m migration.Migration) error {
 		act   func(context.Context, migration.Migration) error
 		to    migration.Phase
 		state migration.State
+		// before runs ahead of the engine call so the status shows what is
+		// happening while it runs; after records the result.
+		before, after func(*migration.Migration)
 	)
 	switch cmd.Command {
 	case migration.CommandFreeze:
@@ -276,10 +287,17 @@ func (w *Worker) runCommand(ctx context.Context, m migration.Migration) error {
 		act, to, state = w.engine.Switch, migration.PhaseSwitched, migration.StateWaiting
 	case migration.CommandResume:
 		act, to, state = w.engine.Resume, migration.PhaseResumed, migration.StateRunning
+		before = func(x *migration.Migration) { x.Replication.Forward.State = migration.FlowDraining }
+		after = func(x *migration.Migration) {
+			x.Replication.Forward = migration.Flow{State: migration.FlowStopped}
+			x.Replication.Reverse = migration.Flow{State: migration.FlowStreaming}
+		}
 	case migration.CommandFinalize:
 		act, to, state = w.engine.Finalize, migration.PhaseCompleted, migration.StateSucceeded
+		after = stopFlows
 	case migration.CommandAbort:
 		act, to, state = w.engine.Abort, migration.PhaseAborted, migration.StateSucceeded
+		after = stopFlows
 	case migration.CommandRollback:
 		// The engine work runs in ROLLING_BACK so a crash resumes it.
 		to, state = migration.PhaseRollingBack, migration.StateRunning
@@ -287,6 +305,17 @@ func (w *Worker) runCommand(ctx context.Context, m migration.Migration) error {
 		return fmt.Errorf("%w: unknown command %q", engine.ErrPermanent, cmd.Command)
 	}
 
+	if before != nil {
+		err := w.mutate(ctx, m.ID, func(x *migration.Migration) error {
+			if sameRequest(x.Pending, cmd) {
+				before(x)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
 	if act != nil {
 		if err := act(ctx, m); err != nil {
 			return err
@@ -298,8 +327,21 @@ func (w *Worker) runCommand(ctx context.Context, m migration.Migration) error {
 		}
 		x.Pending = nil
 		x.LastError = nil
+		if after != nil {
+			after(x)
+		}
 		return w.enter(x, to, state)
 	})
+}
+
+// stopFlows marks both directions as finished, keeping directions that
+// never ran as they were.
+func stopFlows(x *migration.Migration) {
+	for _, f := range []*migration.Flow{&x.Replication.Forward, &x.Replication.Reverse} {
+		if f.State != migration.FlowOff && f.State != migration.FlowNotStarted {
+			*f = migration.Flow{State: migration.FlowStopped}
+		}
+	}
 }
 
 func sameRequest(p *migration.CommandRequest, c migration.CommandRequest) bool {

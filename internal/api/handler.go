@@ -133,7 +133,7 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 	}
 	h.Notifier.Notify(m.ID)
 	w.Header().Set("Location", "/v1/migrations/"+m.ID)
-	writeJSON(w, http.StatusAccepted, m)
+	writeMigration(w, http.StatusAccepted, m)
 }
 
 func (h *handler) get(w http.ResponseWriter, r *http.Request) {
@@ -142,7 +142,18 @@ func (h *handler) get(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, m)
+	writeMigration(w, http.StatusOK, m)
+}
+
+// migrationView is a migration as the API returns it, with the commands the
+// client may send next.
+type migrationView struct {
+	migration.Migration
+	AllowedActions []migration.Command `json:"allowedActions"`
+}
+
+func writeMigration(w http.ResponseWriter, status int, m migration.Migration) {
+	writeJSON(w, status, migrationView{Migration: m, AllowedActions: m.AllowedCommands()})
 }
 
 // pathCommands are the commands sent as POST /v1/migrations/{id}/{command}.
@@ -156,8 +167,9 @@ var pathCommands = map[string]migration.Command{
 }
 
 type commandBody struct {
-	CutoverID  string `json:"cutoverId"`
-	DeadlineMS int64  `json:"deadlineMs"`
+	CutoverID       string `json:"cutoverId"`
+	DeadlineMS      int64  `json:"deadlineMs"`
+	ExpectedVersion int64  `json:"expectedVersion"`
 }
 
 func (h *handler) command(w http.ResponseWriter, r *http.Request) {
@@ -171,19 +183,33 @@ func (h *handler) command(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if body.DeadlineMS < 0 {
-		writeError(w, badRequest("deadlineMs must not be negative"))
+	if body.DeadlineMS < 0 || body.ExpectedVersion < 0 {
+		writeError(w, badRequest("deadlineMs and expectedVersion must not be negative"))
 		return
 	}
 	h.request(w, r, migration.CommandRequest{
-		Command:    cmd,
-		CutoverID:  body.CutoverID,
-		DeadlineMS: body.DeadlineMS,
+		Command:         cmd,
+		CutoverID:       body.CutoverID,
+		DeadlineMS:      body.DeadlineMS,
+		ExpectedVersion: body.ExpectedVersion,
 	})
 }
 
+type abortBody struct {
+	ExpectedVersion int64 `json:"expectedVersion"`
+}
+
 func (h *handler) abort(w http.ResponseWriter, r *http.Request) {
-	h.request(w, r, migration.CommandRequest{Command: migration.CommandAbort})
+	var body abortBody
+	if err := decodeOptional(w, r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	if body.ExpectedVersion < 0 {
+		writeError(w, badRequest("expectedVersion must not be negative"))
+		return
+	}
+	h.request(w, r, migration.CommandRequest{Command: migration.CommandAbort, ExpectedVersion: body.ExpectedVersion})
 }
 
 func (h *handler) request(w http.ResponseWriter, r *http.Request, req migration.CommandRequest) {
@@ -195,7 +221,7 @@ func (h *handler) request(w http.ResponseWriter, r *http.Request, req migration.
 		return
 	}
 	h.Notifier.Notify(m.ID)
-	writeJSON(w, http.StatusAccepted, m)
+	writeMigration(w, http.StatusAccepted, m)
 }
 
 // decode reads a required JSON body and rejects unknown fields.

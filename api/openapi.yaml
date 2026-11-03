@@ -12,9 +12,9 @@ info:
     line several servers up. Each server decides what each command means for
     its resource; for object storage, freeze does nothing.
 
-    Field names in `phase`, `state`, `readiness`, `rollback`, and error
-    bodies are shared. `detail`, `source`, `target`, and `progress.unit` are
-    server-specific.
+    Field names in `phase`, `state`, `readiness`, `replication`,
+    `allowedActions`, and error bodies are shared. `detail`, `source`,
+    `target`, and `replication.initialCopy.unit` are server-specific.
 
 paths:
   /healthz:
@@ -101,6 +101,15 @@ paths:
       summary: Abort a migration before switch
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                expectedVersion: { $ref: "#/components/schemas/ExpectedVersion" }
       responses:
         "202": { $ref: "#/components/responses/Accepted" }
         "404": { $ref: "#/components/responses/Error" }
@@ -115,7 +124,8 @@ paths:
         description: |
           freeze (READY), switch (FROZEN), resume (SWITCHED),
           rollback (FROZEN, SWITCHED, RESUMED, VERIFYING while
-          rollback.allowed), finalize (VERIFYING after verification passed).
+          readiness.rollback is PASS), finalize (VERIFYING while
+          readiness.advance is PASS). allowedActions lists what is accepted now.
         schema:
           type: string
           enum: [freeze, switch, resume, rollback, finalize]
@@ -202,6 +212,14 @@ components:
           type: integer
           minimum: 0
           description: For freeze. How long the server may hold the frozen state.
+        expectedVersion: { $ref: "#/components/schemas/ExpectedVersion" }
+
+    ExpectedVersion:
+      type: integer
+      minimum: 0
+      description: |
+        Optional. The version the client last saw. If it differs from the
+        current version the command is rejected with 409 VERSION_CONFLICT.
 
     Phase:
       type: string
@@ -233,9 +251,33 @@ components:
         ok: { type: boolean }
         message: { type: string }
 
+    Decision:
+      type: object
+      required: [result, checks]
+      description: PASS only when there is at least one check and all pass. No checks is UNKNOWN.
+      properties:
+        result: { type: string, enum: [PASS, FAIL, UNKNOWN] }
+        checks:
+          type: array
+          items: { $ref: "#/components/schemas/Check" }
+
+    Flow:
+      type: object
+      required: [state, backlog, lagSeconds]
+      properties:
+        state:
+          type: string
+          enum: [NOT_STARTED, INITIAL_COPY, STREAMING, DRAINING, STOPPED, OFF]
+          description: |
+            INITIAL_COPY copies what already exists. STREAMING follows changes
+            as they happen (CDC). DRAINING applies the last changes after the
+            switch. OFF means this direction is not used.
+        backlog: { type: integer, description: Changes seen but not applied yet. }
+        lagSeconds: { type: number }
+
     Migration:
       type: object
-      required: [id, type, phase, state, source, target, progress, lag, readiness, rollback, lastError, version, createdAt, updatedAt]
+      required: [id, type, phase, state, source, target, replication, readiness, lastError, version, createdAt, updatedAt, allowedActions]
       properties:
         id: { type: string }
         type: { type: string, enum: [object, db, cache] }
@@ -244,31 +286,36 @@ components:
         detail: { type: string, description: Server-specific sub-step for dashboards. }
         source: { $ref: "#/components/schemas/Endpoint" }
         target: { $ref: "#/components/schemas/Endpoint" }
-        progress:
+        replication:
           type: object
+          required: [forward, reverse, initialCopy]
+          description: How data is moving now. Forward is source to target; reverse is target to source after the switch.
           properties:
-            done: { type: integer }
-            total: { type: integer }
-            unit: { type: string }
-        lag:
-          type: object
-          properties:
-            seconds: { type: number }
-            items: { type: integer }
+            forward: { $ref: "#/components/schemas/Flow" }
+            reverse: { $ref: "#/components/schemas/Flow" }
+            initialCopy:
+              type: object
+              properties:
+                completed: { type: integer }
+                total: { type: integer }
+                unit: { type: string }
         readiness:
           type: object
-          required: [ready, checks]
+          required: [cutover, advance, rollback]
           properties:
-            ready: { type: boolean }
-            checks:
-              type: array
-              items: { $ref: "#/components/schemas/Check" }
-        rollback:
-          type: object
-          required: [allowed]
-          properties:
-            allowed: { type: boolean }
-            reason: { type: string }
+            cutover:
+              allOf: [{ $ref: "#/components/schemas/Decision" }]
+              description: Can freeze start? Judged while syncing.
+            advance:
+              allOf: [{ $ref: "#/components/schemas/Decision" }]
+              description: After resume, does the target match the source so the migration can finalize?
+            rollback:
+              allOf: [{ $ref: "#/components/schemas/Decision" }]
+              description: Can the migration go back to the source now?
+        allowedActions:
+          type: array
+          description: Commands the server would accept now. Still checked again when sent.
+          items: { type: string, enum: [freeze, switch, resume, rollback, finalize, abort] }
         pendingCommand:
           type: object
           properties:
@@ -276,6 +323,7 @@ components:
             idempotencyKey: { type: string }
             cutoverId: { type: string }
             deadlineMs: { type: integer }
+            expectedVersion: { type: integer }
             requestedAt: { type: string, format: date-time }
         lastError:
           oneOf:
@@ -308,7 +356,7 @@ components:
           type: string
           description: |
             INVALID_ARGUMENT (400), NOT_FOUND (404), INVALID_PHASE (409),
-            COMMAND_PENDING (409), PRECONDITION_FAILED (409),
+            COMMAND_PENDING (409), PRECONDITION_FAILED (409), VERSION_CONFLICT (409),
             IDEMPOTENCY_KEY_REUSED (422), INTERNAL (500), ENGINE_ERROR (in lastError only)
         message: { type: string }
         retryable: { type: boolean }

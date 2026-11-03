@@ -33,14 +33,14 @@ func (f *Fake) InitialSync(ctx context.Context, m migration.Migration, report fu
 		if err := f.wait(ctx, f.Delay/total); err != nil {
 			return err
 		}
-		report(migration.Progress{Done: done, Total: total, Unit: "objects"})
+		report(migration.Progress{Completed: done, Total: total, Unit: "objects"})
 	}
 	return nil
 }
 
-func (f *Fake) Sync(ctx context.Context, m migration.Migration) (migration.Readiness, migration.Lag, error) {
+func (f *Fake) Sync(ctx context.Context, m migration.Migration) (SyncReport, error) {
 	if err := f.wait(ctx, f.Delay); err != nil {
-		return migration.Readiness{}, migration.Lag{}, err
+		return SyncReport{}, err
 	}
 	f.mu.Lock()
 	f.rounds[m.ID]++
@@ -48,19 +48,25 @@ func (f *Fake) Sync(ctx context.Context, m migration.Migration) (migration.Readi
 	f.mu.Unlock()
 
 	ready := n >= f.SyncRounds
-	check := migration.Check{Name: "fake_sync_rounds", OK: ready, Message: fmt.Sprintf("%d/%d rounds", min(n, f.SyncRounds), f.SyncRounds)}
-	lag := migration.Lag{}
+	r := SyncReport{Cutover: migration.Decide(migration.Check{
+		Name:    "fake_sync_rounds",
+		OK:      ready,
+		Message: fmt.Sprintf("%d/%d rounds", min(n, f.SyncRounds), f.SyncRounds),
+	})}
 	if !ready {
-		lag = migration.Lag{Seconds: 1, Items: 1}
+		r.Backlog, r.LagSeconds = 1, 1
 	}
-	return migration.Readiness{Ready: ready, Checks: []migration.Check{check}}, lag, nil
+	return r, nil
 }
 
-func (f *Fake) Verify(ctx context.Context, _ migration.Migration) (migration.Readiness, error) {
+func (f *Fake) Verify(ctx context.Context, _ migration.Migration) (VerifyReport, error) {
 	if err := f.wait(ctx, f.Delay); err != nil {
-		return migration.Readiness{}, err
+		return VerifyReport{}, err
 	}
-	return migration.Readiness{Ready: true, Checks: []migration.Check{{Name: "fake_diff", OK: true}}}, nil
+	return VerifyReport{
+		Advance:  migration.Decide(migration.Check{Name: "fake_diff", OK: true}),
+		Rollback: migration.Decide(migration.Check{Name: "fake_reverse_sync", OK: true}),
+	}, nil
 }
 
 func (f *Fake) Freeze(ctx context.Context, _ migration.Migration) error { return f.wait(ctx, f.Delay) }

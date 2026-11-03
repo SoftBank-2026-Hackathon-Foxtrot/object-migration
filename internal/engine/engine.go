@@ -23,13 +23,29 @@ type Engine interface {
 	InitialSync(ctx context.Context, m migration.Migration, report func(migration.Progress)) error
 	// Sync runs one round of incremental sync and judges whether cutover can
 	// start.
-	Sync(ctx context.Context, m migration.Migration) (migration.Readiness, migration.Lag, error)
+	Sync(ctx context.Context, m migration.Migration) (SyncReport, error)
 	Freeze(ctx context.Context, m migration.Migration) error
 	Switch(ctx context.Context, m migration.Migration) error
 	Resume(ctx context.Context, m migration.Migration) error
-	// Verify compares source and target after resume. Ready means they match.
-	Verify(ctx context.Context, m migration.Migration) (migration.Readiness, error)
+	// Verify compares source and target after resume and checks that the
+	// reverse sync can still carry a rollback.
+	Verify(ctx context.Context, m migration.Migration) (VerifyReport, error)
 	Finalize(ctx context.Context, m migration.Migration) error
 	Rollback(ctx context.Context, m migration.Migration) error
 	Abort(ctx context.Context, m migration.Migration) error
+}
+
+// SyncReport is the result of one incremental sync round.
+type SyncReport struct {
+	Cutover    migration.Decision
+	Backlog    int64
+	LagSeconds float64
+}
+
+// VerifyReport is the result of comparing source and target after resume.
+type VerifyReport struct {
+	Advance           migration.Decision
+	Rollback          migration.Decision
+	ReverseBacklog    int64
+	ReverseLagSeconds float64
 }

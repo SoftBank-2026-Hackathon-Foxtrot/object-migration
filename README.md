@@ -10,6 +10,13 @@ Design: [architecture](https://softbank-2026-hackathon-foxtrot.github.io/design-
 
 M1: the common API and the worker run the whole phase flow with a fake engine. No real copying yet; that starts in M2 with rclone.
 
+The status response shows, per migration:
+
+- `phase` and `state`: the step it is in and whether that step is still working
+- `replication.forward` and `replication.reverse`: whether each direction is in the initial copy, following changes (CDC), draining, stopped, or off
+- `readiness.cutover`, `readiness.advance`, `readiness.rollback`: PASS, FAIL, or UNKNOWN for freezing, finalizing, and going back, with the checks behind each
+- `allowedActions`: the commands accepted right now
+
 ## Run
 
 ```sh
@@ -27,7 +34,7 @@ Drive a migration with curl:
 ```sh
 ID=$(curl -s -X POST localhost:8080/v1/migrations \
   -d '{"source":{"kind":"s3","bucket":"src","ref":"env:AWS"},"target":{"kind":"gcs","bucket":"dst","ref":"env:GCP"}}' | jq -r .id)
-curl -s localhost:8080/v1/migrations/$ID | jq '{phase,state}'   # wait for READY
+curl -s localhost:8080/v1/migrations/$ID | jq '{phase,state,replication,allowedActions}'   # wait for READY
 curl -s -X POST localhost:8080/v1/migrations/$ID/freeze
 curl -s -X POST localhost:8080/v1/migrations/$ID/switch
 curl -s -X POST localhost:8080/v1/migrations/$ID/resume       # wait for VERIFYING/succeeded

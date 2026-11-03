@@ -57,18 +57,29 @@ func (c client) expect(r response, status int) response {
 	return r
 }
 
-func (c client) waitFor(id, phase, state string) {
+func (c client) waitFor(id, phase, state string) map[string]any {
 	c.t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	var last map[string]any
 	for time.Now().Before(deadline) {
 		last = c.expect(c.call(http.MethodGet, "/v1/migrations/"+id, ""), http.StatusOK).body
 		if last["phase"] == phase && (state == "" || last["state"] == state) {
-			return
+			return last
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	c.t.Fatalf("timed out waiting for %s/%s, last: phase=%v state=%v", phase, state, last["phase"], last["state"])
+	return nil
+}
+
+// flows returns the forward and reverse replication states of a status body.
+func flows(body map[string]any) (string, string) {
+	r, _ := body["replication"].(map[string]any)
+	f, _ := r["forward"].(map[string]any)
+	b, _ := r["reverse"].(map[string]any)
+	fs, _ := f["state"].(string)
+	bs, _ := b["state"].(string)
+	return fs, bs
 }
 
 // TestMigrationFlowOverHTTP is the M1 completion check: a migration goes from
@@ -91,7 +102,10 @@ func TestMigrationFlowOverHTTP(t *testing.T) {
 		"Idempotency-Key", "create-1"), http.StatusAccepted)
 	id := created.body["id"].(string)
 
-	c.waitFor(id, "READY", "waiting")
+	ready := c.waitFor(id, "READY", "waiting")
+	if f, r := flows(ready); f != "STREAMING" || r != "OFF" {
+		t.Fatalf("at READY: forward=%s reverse=%s", f, r)
+	}
 
 	// A command in the wrong phase is rejected.
 	r := c.expect(c.call(http.MethodPost, "/v1/migrations/"+id+"/switch", ""), http.StatusConflict)
@@ -113,9 +127,15 @@ func TestMigrationFlowOverHTTP(t *testing.T) {
 	c.expect(c.call(http.MethodPost, "/v1/migrations/"+id+"/switch", `{"cutoverId":"c-1"}`), http.StatusAccepted)
 	c.waitFor(id, "SWITCHED", "")
 	c.expect(c.call(http.MethodPost, "/v1/migrations/"+id+"/resume", `{"cutoverId":"c-1"}`), http.StatusAccepted)
-	c.waitFor(id, "VERIFYING", "succeeded")
+	verified := c.waitFor(id, "VERIFYING", "succeeded")
+	if f, r := flows(verified); f != "STOPPED" || r != "STREAMING" {
+		t.Fatalf("after resume: forward=%s reverse=%s", f, r)
+	}
 	c.expect(c.call(http.MethodPost, "/v1/migrations/"+id+"/finalize", ""), http.StatusAccepted)
-	c.waitFor(id, "COMPLETED", "succeeded")
+	completed := c.waitFor(id, "COMPLETED", "succeeded")
+	if f, r := flows(completed); f != "STOPPED" || r != "STOPPED" {
+		t.Fatalf("after finalize: forward=%s reverse=%s", f, r)
+	}
 
 	// Nothing is allowed after completion.
 	c.expect(c.call(http.MethodPost, "/v1/migrations/"+id+"/rollback", ""), http.StatusConflict)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -277,5 +278,48 @@ func TestConcurrentRequestsWithSameKeyCreateOnce(t *testing.T) {
 		if id != list[0].ID {
 			t.Fatalf("response %d has id %q, want %q", i, id, list[0].ID)
 		}
+	}
+}
+
+func TestStatusShowsAllowedActionsAndReplication(t *testing.T) {
+	h, _, st := newTestHandlerWithStore()
+	id := decodeBody(t, do(t, h, http.MethodPost, "/v1/migrations", validBody))["id"].(string)
+	setState(t, st, id, func(m *migration.Migration) {
+		m.Phase = migration.PhaseReady
+		m.Replication.Forward.State = migration.FlowStreaming
+	})
+
+	body := decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))
+	allowed, _ := json.Marshal(body["allowedActions"])
+	if string(allowed) != `["freeze","abort"]` {
+		t.Fatalf("allowedActions = %s", allowed)
+	}
+	repl, _ := body["replication"].(map[string]any)
+	forward, _ := repl["forward"].(map[string]any)
+	reverse, _ := repl["reverse"].(map[string]any)
+	if forward["state"] != "STREAMING" || reverse["state"] != "OFF" {
+		t.Fatalf("replication = %v", repl)
+	}
+	readiness, _ := body["readiness"].(map[string]any)
+	for _, k := range []string{"cutover", "advance", "rollback"} {
+		if _, ok := readiness[k].(map[string]any)["result"]; !ok {
+			t.Fatalf("readiness.%s missing result: %v", k, readiness)
+		}
+	}
+}
+
+func TestStaleExpectedVersionIsConflict(t *testing.T) {
+	h, _, st := newTestHandlerWithStore()
+	id := decodeBody(t, do(t, h, http.MethodPost, "/v1/migrations", validBody))["id"].(string)
+	setState(t, st, id, func(m *migration.Migration) { m.Phase = migration.PhaseReady })
+	current := int(decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))["version"].(float64))
+
+	stale := `{"expectedVersion":` + strconv.Itoa(current-1) + `}`
+	wantError(t, do(t, h, http.MethodPost, "/v1/migrations/"+id+"/freeze", stale), http.StatusConflict, "VERSION_CONFLICT")
+	wantError(t, do(t, h, http.MethodDelete, "/v1/migrations/"+id, stale), http.StatusConflict, "VERSION_CONFLICT")
+
+	ok := `{"expectedVersion":` + strconv.Itoa(current) + `}`
+	if rec := do(t, h, http.MethodPost, "/v1/migrations/"+id+"/freeze", ok); rec.Code != http.StatusAccepted {
+		t.Fatalf("current version: %d %s", rec.Code, rec.Body)
 	}
 }
