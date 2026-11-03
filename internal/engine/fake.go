@@ -27,6 +27,12 @@ func NewFake(delay time.Duration) *Fake {
 
 func (f *Fake) Name() string { return "fake" }
 
+func (f *Fake) ReverseSync() bool { return true }
+
+func (f *Fake) Preflight(context.Context, migration.Endpoint, migration.Endpoint) []migration.Check {
+	return []migration.Check{{Name: "fake_access", OK: true, Message: "the fake engine touches no storage"}}
+}
+
 func (f *Fake) InitialSync(ctx context.Context, m migration.Migration, report func(migration.Progress)) error {
 	const total = 10
 	for done := int64(1); done <= total; done++ {

@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/api"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/copier"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/engine"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/worker"
@@ -34,22 +36,26 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	stepDelay, err := durationEnv("FAKE_STEP_DELAY", 2*time.Second)
+	eng, defaultSync, err := newEngine()
+	if err != nil {
+		return err
+	}
+	syncInterval, err := durationEnv("SYNC_INTERVAL", defaultSync)
 	if err != nil {
 		return err
 	}
 
 	st := store.NewMemory()
-	eng := engine.NewFake(stepDelay)
-	w := worker.New(st, eng, worker.Config{PollInterval: poll, RetryBackoff: poll}, logger)
+	w := worker.New(st, eng, worker.Config{PollInterval: poll, RetryBackoff: poll, SyncInterval: syncInterval}, logger)
 
 	srv := &http.Server{
 		Addr: addr,
 		Handler: api.NewHandler(api.Deps{
-			Store:    st,
-			Notifier: w,
-			Engine:   eng.Name(),
-			Logger:   logger,
+			Store:     st,
+			Notifier:  w,
+			Engine:    eng.Name(),
+			Preflight: eng,
+			Logger:    logger,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -65,7 +71,7 @@ func run(logger *slog.Logger) error {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		logger.Info("listening", "addr", addr, "engine", eng.Name())
+		logger.Info("listening", "addr", addr, "engine", eng.Name(), "syncInterval", syncInterval.String())
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 		}
@@ -88,11 +94,49 @@ func run(logger *slog.Logger) error {
 	return err
 }
 
+// newEngine picks the engine from ENGINE and returns it with its default
+// wait between sync rounds. Each rclone round lists both buckets, so rounds
+// are spaced out; fake rounds cost nothing.
+func newEngine() (engine.Engine, time.Duration, error) {
+	switch name := envOr("ENGINE", "rclone"); name {
+	case "rclone":
+		transfers, err := intEnv("COPY_TRANSFERS", 16)
+		if err != nil {
+			return nil, 0, err
+		}
+		checkers, err := intEnv("COPY_CHECKERS", 16)
+		if err != nil {
+			return nil, 0, err
+		}
+		return engine.NewRclone(copier.Options{Transfers: transfers, Checkers: checkers}), 30 * time.Second, nil
+	case "fake":
+		delay, err := durationEnv("FAKE_STEP_DELAY", 2*time.Second)
+		if err != nil {
+			return nil, 0, err
+		}
+		return engine.NewFake(delay), 2 * time.Second, nil
+	default:
+		return nil, 0, fmt.Errorf("ENGINE: want rclone or fake, got %q", name)
+	}
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
+}
+
+func intEnv(key string, def int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s: want a positive integer, got %q", key, v)
+	}
+	return n, nil
 }
 
 func durationEnv(key string, def time.Duration) (time.Duration, error) {

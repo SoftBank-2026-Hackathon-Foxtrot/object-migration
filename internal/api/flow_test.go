@@ -98,7 +98,7 @@ func TestMigrationFlowOverHTTP(t *testing.T) {
 	c := client{t: t, url: srv.URL}
 
 	created := c.expect(c.call(http.MethodPost, "/v1/migrations",
-		`{"source":{"kind":"s3","bucket":"foxtrot-src","ref":"env:AWS"},"target":{"kind":"gcs","bucket":"foxtrot-dst","ref":"env:GCP"}}`,
+		`{"source":{"kind":"s3","bucket":"foxtrot-src","region":"ap-northeast-1","ref":"env:AWS"},"target":{"kind":"gcs","bucket":"foxtrot-dst","ref":"env:GCP"}}`,
 		"Idempotency-Key", "create-1"), http.StatusAccepted)
 	id := created.body["id"].(string)
 

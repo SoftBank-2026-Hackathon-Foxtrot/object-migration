@@ -40,7 +40,7 @@ func start(t *testing.T, s store.Store, e engine.Engine) (*Worker, func()) {
 func create(t *testing.T, s store.Store) migration.Migration {
 	t.Helper()
 	m, err := migration.New(
-		migration.Endpoint{Kind: migration.KindS3, Bucket: "src", Ref: "env:SRC"},
+		migration.Endpoint{Kind: migration.KindS3, Bucket: "src", Region: "ap-northeast-1", Ref: "env:SRC"},
 		migration.Endpoint{Kind: migration.KindGCS, Bucket: "dst", Ref: "env:DST"},
 		time.Now(),
 	)
@@ -477,4 +477,100 @@ func toFrozenFrom(t *testing.T, w *Worker, s store.Store, id string) migration.M
 	waitPhase(t, s, id, migration.PhaseReady)
 	command(t, w, s, id, migration.CommandFreeze)
 	return waitPhase(t, s, id, migration.PhaseFrozen)
+}
+
+// endless never finishes the initial copy unless its context is cancelled.
+type endless struct {
+	*engine.Fake
+	started   chan struct{}
+	cancelled atomic.Bool
+}
+
+func (e *endless) InitialSync(ctx context.Context, _ migration.Migration, report func(migration.Progress)) error {
+	report(migration.Progress{Completed: 1, Total: 1000, Unit: "objects"})
+	close(e.started)
+	<-ctx.Done()
+	e.cancelled.Store(true)
+	return ctx.Err()
+}
+
+func TestAbortInterruptsInitialCopy(t *testing.T) {
+	s := store.NewMemory()
+	e := &endless{Fake: engine.NewFake(time.Millisecond), started: make(chan struct{})}
+	w, _ := start(t, s, e)
+	m := create(t, s)
+	w.Notify(m.ID)
+	<-e.started
+
+	command(t, w, s, m.ID, migration.CommandAbort)
+	got := waitPhase(t, s, m.ID, migration.PhaseAborted)
+	if !e.cancelled.Load() {
+		t.Fatal("the copy was not cancelled")
+	}
+	if got.LastError != nil {
+		t.Fatalf("interruption recorded as an error: %+v", got.LastError)
+	}
+	if got.Replication.Forward.State != migration.FlowStopped {
+		t.Fatalf("forward = %s, want STOPPED", got.Replication.Forward.State)
+	}
+}
+
+// countingSyncs is a Fake that counts sync rounds.
+type countingSyncs struct {
+	*engine.Fake
+	syncs atomic.Int32
+}
+
+func (c *countingSyncs) Sync(ctx context.Context, m migration.Migration) (engine.SyncReport, error) {
+	c.syncs.Add(1)
+	return c.Fake.Sync(ctx, m)
+}
+
+func TestSyncRoundsWaitSyncInterval(t *testing.T) {
+	s := store.NewMemory()
+	e := &countingSyncs{Fake: engine.NewFake(time.Millisecond)}
+	cfg := testCfg
+	cfg.SyncInterval = time.Hour
+	w := New(s, e, cfg, quietLog())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = w.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	m := create(t, s)
+	w.Notify(m.ID)
+	waitFor(t, s, m.ID, "first sync round", func(m migration.Migration) bool {
+		return m.Phase == migration.PhaseSyncing && m.Readiness.Cutover.Result != migration.ResultUnknown
+	})
+	time.Sleep(20 * testCfg.PollInterval)
+	if n := e.syncs.Load(); n != 1 {
+		t.Fatalf("%d sync rounds within the interval, want 1", n)
+	}
+
+	// A command does not wait for the next round.
+	command(t, w, s, m.ID, migration.CommandAbort)
+	waitPhase(t, s, m.ID, migration.PhaseAborted)
+}
+
+// oneWay is a Fake that does not copy anything back after resume.
+type oneWay struct{ *engine.Fake }
+
+func (oneWay) ReverseSync() bool { return false }
+
+func TestReverseStaysOffWithoutReverseSync(t *testing.T) {
+	s := store.NewMemory()
+	w, _ := start(t, s, oneWay{engine.NewFake(time.Millisecond)})
+	m := toFrozen(t, w, s)
+	command(t, w, s, m.ID, migration.CommandSwitch)
+	waitPhase(t, s, m.ID, migration.PhaseSwitched)
+	command(t, w, s, m.ID, migration.CommandResume)
+	got := waitPhase(t, s, m.ID, migration.PhaseVerifying)
+	if got.Replication.Reverse.State != migration.FlowOff {
+		t.Fatalf("reverse = %s, want OFF", got.Replication.Reverse.State)
+	}
+	waitFor(t, s, m.ID, "verified", func(m migration.Migration) bool { return m.State == migration.StateSucceeded })
+	command(t, w, s, m.ID, migration.CommandFinalize)
+	if done := waitPhase(t, s, m.ID, migration.PhaseCompleted); done.Replication.Reverse.State != migration.FlowOff {
+		t.Fatalf("reverse after finalize = %s, want OFF", done.Replication.Reverse.State)
+	}
 }

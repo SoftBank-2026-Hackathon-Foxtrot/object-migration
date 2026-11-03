@@ -18,6 +18,12 @@ var ErrPermanent = errors.New("permanent error")
 type Engine interface {
 	// Name identifies the engine in the capabilities response.
 	Name() string
+	// ReverseSync reports whether Resume starts copying the target's changes
+	// back to the source, so the status can say whether that happens.
+	ReverseSync() bool
+	// Preflight checks that both buckets can be reached with the access the
+	// migration needs, without changing anything the app can see.
+	Preflight(ctx context.Context, source, target migration.Endpoint) []migration.Check
 	// InitialSync copies everything already in the source. report may be
 	// called any number of times with the latest progress.
 	InitialSync(ctx context.Context, m migration.Migration, report func(migration.Progress)) error

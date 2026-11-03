@@ -22,6 +22,9 @@ type Config struct {
 	PollInterval time.Duration
 	// RetryBackoff is the wait after a failed engine call.
 	RetryBackoff time.Duration
+	// SyncInterval is the wait between incremental sync rounds and between
+	// verification attempts. Zero means PollInterval.
+	SyncInterval time.Duration
 }
 
 type Worker struct {
@@ -34,17 +37,24 @@ type Worker struct {
 	mu      sync.Mutex
 	ctx     context.Context // set by Run; nil until then
 	running map[string]chan struct{}
-	wg      sync.WaitGroup
+	// interrupt cancels the copy a migration is running, so a command
+	// recorded meanwhile does not wait for it.
+	interrupt map[string]context.CancelFunc
+	wg        sync.WaitGroup
 }
 
 func New(s store.Store, e engine.Engine, cfg Config, log *slog.Logger) *Worker {
+	if cfg.SyncInterval == 0 {
+		cfg.SyncInterval = cfg.PollInterval
+	}
 	return &Worker{
-		store:   s,
-		engine:  e,
-		cfg:     cfg,
-		log:     log,
-		now:     time.Now,
-		running: make(map[string]chan struct{}),
+		store:     s,
+		engine:    e,
+		cfg:       cfg,
+		log:       log,
+		now:       time.Now,
+		running:   make(map[string]chan struct{}),
+		interrupt: make(map[string]context.CancelFunc),
 	}
 }
 
@@ -70,8 +80,9 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 // Notify asks the worker to look at a migration now, for example after the
-// API recorded a command. Missing a notification only delays the work until
-// the next poll.
+// API recorded a command. A copy in progress is interrupted so the command
+// runs first; the copy picks up where it left off afterwards. Missing a
+// notification only delays the work until the next poll.
 func (w *Worker) Notify(id string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -79,6 +90,10 @@ func (w *Worker) Notify(id string) {
 		return
 	}
 	if wake, ok := w.running[id]; ok {
+		if cancel, ok := w.interrupt[id]; ok {
+			cancel()
+			return
+		}
 		select {
 		case wake <- struct{}{}:
 		default:
@@ -86,6 +101,33 @@ func (w *Worker) Notify(id string) {
 		return
 	}
 	w.startLocked(id)
+}
+
+// interruptible returns a context for a copy that Notify may cancel, and a
+// function to call when the copy is over. A notification that came in after
+// the migration was loaded cancels the copy at once.
+func (w *Worker) interruptible(ctx context.Context, id string) (context.Context, func()) {
+	ictx, cancel := context.WithCancel(ctx)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	select {
+	case <-w.running[id]:
+		cancel()
+	default:
+		w.interrupt[id] = cancel
+	}
+	return ictx, func() {
+		w.mu.Lock()
+		delete(w.interrupt, id)
+		w.mu.Unlock()
+		cancel()
+	}
+}
+
+// interrupted reports whether a copy stopped because Notify cancelled it
+// rather than because the worker is stopping.
+func interrupted(ctx, ictx context.Context) bool {
+	return ctx.Err() == nil && ictx.Err() != nil
 }
 
 func (w *Worker) rescan(ctx context.Context) {
@@ -183,6 +225,8 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 		})
 
 	case migration.PhaseInitialSync:
+		ictx, done := w.interruptible(ctx, m.ID)
+		defer done()
 		report := func(p migration.Progress) {
 			err := w.mutate(ctx, m.ID, func(x *migration.Migration) error {
 				x.Replication.InitialCopy = p
@@ -192,7 +236,10 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 				w.log.Warn("save progress", "migration", m.ID, "err", err)
 			}
 		}
-		if err := w.engine.InitialSync(ctx, m, report); err != nil {
+		if err := w.engine.InitialSync(ictx, m, report); err != nil {
+			if interrupted(ctx, ictx) {
+				return 0, nil
+			}
 			return 0, err
 		}
 		return 0, w.mutate(ctx, m.ID, func(x *migration.Migration) error {
@@ -202,8 +249,13 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 		})
 
 	case migration.PhaseSyncing, migration.PhaseReady:
-		report, err := w.engine.Sync(ctx, m)
+		ictx, done := w.interruptible(ctx, m.ID)
+		defer done()
+		report, err := w.engine.Sync(ictx, m)
 		if err != nil {
+			if interrupted(ctx, ictx) {
+				return 0, nil
+			}
 			return 0, err
 		}
 		err = w.mutate(ctx, m.ID, func(x *migration.Migration) error {
@@ -225,7 +277,7 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 			}
 			return nil
 		})
-		return w.cfg.PollInterval, err
+		return w.cfg.SyncInterval, err
 
 	case migration.PhaseResumed:
 		return 0, w.mutate(ctx, m.ID, func(x *migration.Migration) error {
@@ -252,7 +304,8 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 			}
 			return nil
 		})
-		return w.cfg.PollInterval, err
+		// Verifying lists both buckets, like a sync round.
+		return w.cfg.SyncInterval, err
 
 	case migration.PhaseRollingBack:
 		if err := w.engine.Rollback(ctx, m); err != nil {
@@ -288,9 +341,13 @@ func (w *Worker) runCommand(ctx context.Context, m migration.Migration) error {
 	case migration.CommandResume:
 		act, to, state = w.engine.Resume, migration.PhaseResumed, migration.StateRunning
 		before = func(x *migration.Migration) { x.Replication.Forward.State = migration.FlowDraining }
+		reverse := migration.FlowOff
+		if w.engine.ReverseSync() {
+			reverse = migration.FlowStreaming
+		}
 		after = func(x *migration.Migration) {
 			x.Replication.Forward = migration.Flow{State: migration.FlowStopped}
-			x.Replication.Reverse = migration.Flow{State: migration.FlowStreaming}
+			x.Replication.Reverse = migration.Flow{State: reverse}
 		}
 	case migration.CommandFinalize:
 		act, to, state = w.engine.Finalize, migration.PhaseCompleted, migration.StateSucceeded

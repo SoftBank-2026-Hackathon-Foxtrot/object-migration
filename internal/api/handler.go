@@ -4,6 +4,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,13 +22,21 @@ type Notifier interface {
 	Notify(id string)
 }
 
+// Preflighter checks that both buckets of a migration can be reached.
+type Preflighter interface {
+	Preflight(ctx context.Context, source, target migration.Endpoint) []migration.Check
+}
+
 type Deps struct {
 	Store    store.Store
 	Notifier Notifier
 	// Engine is the engine name reported by /v1/capabilities.
 	Engine string
-	Logger *slog.Logger
-	Now    func() time.Time
+	// Preflight runs the access checks of POST /v1/preflight. Nil checks
+	// only the request.
+	Preflight Preflighter
+	Logger    *slog.Logger
+	Now       func() time.Time
 }
 
 type handler struct {
@@ -89,8 +98,11 @@ type endpointsRequest struct {
 	Target migration.Endpoint `json:"target"`
 }
 
-// preflight only validates the request for now. Access checks against the
-// real buckets come with the rclone engine.
+// preflightTimeout bounds the access checks of one preflight request.
+const preflightTimeout = time.Minute
+
+// preflight checks that a migration could start: the request is valid and
+// both buckets can be reached. It changes nothing the app can see.
 func (h *handler) preflight(w http.ResponseWriter, r *http.Request) {
 	var req endpointsRequest
 	if err := decode(w, r, &req); err != nil {
@@ -100,6 +112,11 @@ func (h *handler) preflight(w http.ResponseWriter, r *http.Request) {
 	checks := []migration.Check{
 		endpointCheck("source_valid", req.Source),
 		endpointCheck("target_valid", req.Target),
+	}
+	if checks[0].OK && checks[1].OK && h.Preflight != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), preflightTimeout)
+		checks = append(checks, h.Preflight.Preflight(ctx, req.Source, req.Target)...)
+		cancel()
 	}
 	ok := true
 	for _, c := range checks {

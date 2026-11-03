@@ -14,7 +14,7 @@ import (
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 )
 
-const validBody = `{"source":{"kind":"s3","bucket":"src","ref":"env:SRC"},"target":{"kind":"gcs","bucket":"dst","ref":"env:DST"}}`
+const validBody = `{"source":{"kind":"s3","bucket":"src","region":"ap-northeast-1","ref":"env:SRC"},"target":{"kind":"gcs","bucket":"dst","ref":"env:DST"}}`
 
 type recordingNotifier struct {
 	mu  sync.Mutex
@@ -180,7 +180,7 @@ func TestIdempotentCreateReplays(t *testing.T) {
 	if len(n.ids) != 1 {
 		t.Fatalf("created %d migrations, want 1", len(n.ids))
 	}
-	other := `{"source":{"kind":"s3","bucket":"other","ref":"env:SRC"},"target":{"kind":"gcs","bucket":"dst","ref":"env:DST"}}`
+	other := `{"source":{"kind":"s3","bucket":"other","region":"ap-northeast-1","ref":"env:SRC"},"target":{"kind":"gcs","bucket":"dst","ref":"env:DST"}}`
 	wantError(t, do(t, h, http.MethodPost, "/v1/migrations", other, idempotencyHeader, "create-1"), http.StatusUnprocessableEntity, "IDEMPOTENCY_KEY_REUSED")
 }
 
@@ -194,13 +194,46 @@ func TestCapabilities(t *testing.T) {
 
 func TestPreflightReportsInvalidEndpoint(t *testing.T) {
 	h, _ := newTestHandler()
-	bad := `{"source":{"kind":"s3","bucket":"src","ref":"env:SRC"},"target":{"kind":"seaweedfs","bucket":"dst","ref":"env:DST"}}`
+	bad := `{"source":{"kind":"s3","bucket":"src","region":"ap-northeast-1","ref":"env:SRC"},"target":{"kind":"seaweedfs","bucket":"dst","ref":"env:DST"}}`
 	body := decodeBody(t, do(t, h, http.MethodPost, "/v1/preflight", bad))
 	if body["ok"] != false {
 		t.Fatalf("ok = %v, want false", body["ok"])
 	}
 	if body := decodeBody(t, do(t, h, http.MethodPost, "/v1/preflight", validBody)); body["ok"] != true {
 		t.Fatalf("valid request: ok = %v", body["ok"])
+	}
+}
+
+type stubPreflight struct {
+	calls  int
+	checks []migration.Check
+}
+
+func (p *stubPreflight) Preflight(context.Context, migration.Endpoint, migration.Endpoint) []migration.Check {
+	p.calls++
+	return p.checks
+}
+
+func TestPreflightRunsEngineChecks(t *testing.T) {
+	p := &stubPreflight{checks: []migration.Check{
+		{Name: "source_read", OK: true},
+		{Name: "target_write", OK: false, Message: "access denied"},
+	}}
+	h := NewHandler(Deps{Store: store.NewMemory(), Preflight: p})
+
+	body := decodeBody(t, do(t, h, http.MethodPost, "/v1/preflight", validBody))
+	checks, _ := body["checks"].([]any)
+	if body["ok"] != false || len(checks) != 4 {
+		t.Fatalf("body = %v, want ok=false with 2 request and 2 engine checks", body)
+	}
+	if last := checks[3].(map[string]any); last["name"] != "target_write" || last["message"] != "access denied" {
+		t.Fatalf("last check = %v", last)
+	}
+
+	// An invalid request is not sent to the engine.
+	bad := `{"source":{"kind":"s3","bucket":"src","ref":"env:SRC"},"target":{"kind":"gcs","bucket":"dst","ref":"env:DST"}}`
+	if body := decodeBody(t, do(t, h, http.MethodPost, "/v1/preflight", bad)); body["ok"] != false || p.calls != 1 {
+		t.Fatalf("invalid request: ok=%v, engine calls=%d", body["ok"], p.calls)
 	}
 }
 

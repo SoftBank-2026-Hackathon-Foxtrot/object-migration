@@ -9,7 +9,7 @@ import (
 
 var (
 	t0  = time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
-	src = Endpoint{Kind: KindS3, Bucket: "foxtrot-src", Ref: "secret://aws-s3"}
+	src = Endpoint{Kind: KindS3, Bucket: "foxtrot-src", Region: "ap-northeast-1", Ref: "secret://aws-s3"}
 	dst = Endpoint{Kind: KindGCS, Bucket: "foxtrot-dst", Ref: "secret://gcp-gcs"}
 )
 
@@ -28,8 +28,9 @@ func TestNewValidatesEndpoints(t *testing.T) {
 		src, dst Endpoint
 	}{
 		{"unknown kind", Endpoint{Kind: "ftp", Bucket: "b", Ref: "r"}, dst},
-		{"missing bucket", Endpoint{Kind: KindS3, Ref: "r"}, dst},
-		{"missing ref", Endpoint{Kind: KindS3, Bucket: "b"}, dst},
+		{"missing bucket", Endpoint{Kind: KindS3, Region: "ap-northeast-1", Ref: "r"}, dst},
+		{"missing ref", Endpoint{Kind: KindS3, Region: "ap-northeast-1", Bucket: "b"}, dst},
+		{"missing s3 region", Endpoint{Kind: KindS3, Bucket: "b", Ref: "r"}, dst},
 		{"seaweedfs without url", src, Endpoint{Kind: KindSeaweedFS, Bucket: "b", Ref: "r"}},
 		{"same bucket", src, src},
 	}

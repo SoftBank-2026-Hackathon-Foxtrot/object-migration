@@ -43,6 +43,10 @@ paths:
   /v1/preflight:
     post:
       summary: Check a migration request without changing anything
+      description: >-
+        Validates the request, then checks that the server can list the
+        source and target and write the target. The write check puts a small
+        object under `.object-migration/` in the target and deletes it.
       requestBody:
         required: true
         content:
@@ -185,12 +189,22 @@ components:
       properties:
         kind: { $ref: "#/components/schemas/Kind" }
         bucket: { type: string }
+        region:
+          type: string
+          description: Bucket region. Required for s3.
+          example: ap-northeast-1
         url:
           type: string
           description: S3-compatible endpoint. Required for seaweedfs.
         ref:
           type: string
-          description: Reference to credentials in the secret store, never the secret itself.
+          description: >-
+            Where the server finds credentials, never the secret itself.
+            `default` uses the platform's default credentials (AWS SDK chain,
+            GCP Application Default Credentials). `env:NAME` reads
+            NAME_ACCESS_KEY_ID, NAME_SECRET_ACCESS_KEY and optionally
+            NAME_SESSION_TOKEN for s3 and seaweedfs, or NAME_CREDENTIALS_FILE
+            (a service account key file) for gcs.
           example: env:AWS_SOURCE
 
     EndpointsRequest:
@@ -299,6 +313,10 @@ components:
                 completed: { type: integer }
                 total: { type: integer }
                 unit: { type: string }
+                bytes:
+                  type: integer
+                  description: Progress by size, when known.
+                totalBytes: { type: integer }
         readiness:
           type: object
           required: [cutover, advance, rollback]

@@ -27,6 +27,8 @@ const (
 type Endpoint struct {
 	Kind   Kind   `json:"kind"`
 	Bucket string `json:"bucket"`
+	// Region is the bucket's region. Required for s3.
+	Region string `json:"region,omitempty"`
 	// URL is the S3-compatible endpoint. Required for seaweedfs.
 	URL string `json:"url,omitempty"`
 	// Ref points to credentials in the secret store, never the secret itself.
@@ -36,7 +38,11 @@ type Endpoint struct {
 // Validate reports whether the endpoint has the fields its kind needs.
 func (e Endpoint) Validate() error {
 	switch e.Kind {
-	case KindS3, KindGCS:
+	case KindS3:
+		if e.Region == "" {
+			return errors.New("region is required for s3")
+		}
+	case KindGCS:
 	case KindSeaweedFS:
 		if e.URL == "" {
 			return errors.New("url is required for seaweedfs")
@@ -151,6 +157,10 @@ type Progress struct {
 	Completed int64  `json:"completed"`
 	Total     int64  `json:"total"`
 	Unit      string `json:"unit"`
+	// Bytes and TotalBytes give the same progress by size, when known. A
+	// few large objects can keep Completed still for a long time.
+	Bytes      int64 `json:"bytes,omitempty"`
+	TotalBytes int64 `json:"totalBytes,omitempty"`
 }
 
 type Check struct {

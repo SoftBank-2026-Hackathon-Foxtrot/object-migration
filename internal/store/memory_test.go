@@ -15,7 +15,7 @@ var ctx = context.Background()
 func create(t *testing.T, s *Memory) migration.Migration {
 	t.Helper()
 	m, err := migration.New(
-		migration.Endpoint{Kind: migration.KindS3, Bucket: "src", Ref: "secret://a"},
+		migration.Endpoint{Kind: migration.KindS3, Bucket: "src", Region: "ap-northeast-1", Ref: "secret://a"},
 		migration.Endpoint{Kind: migration.KindGCS, Bucket: "dst", Ref: "secret://b"},
 		time.Now(),
 	)
