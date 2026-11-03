@@ -1,0 +1,314 @@
+openapi: 3.1.0
+info:
+  title: Migration server common API
+  version: 0.1.0
+  description: |
+    Draft of the API every migration server (object, DB, cache) implements.
+    The orchestrator drives a migration with commands; the server answers
+    202 at once and does the work in the background. Poll GET
+    /v1/migrations/{id} to follow progress.
+
+    Cutover is split into freeze, switch, and resume so the orchestrator can
+    line several servers up. Each server decides what each command means for
+    its resource; for object storage, freeze does nothing.
+
+    Field names in `phase`, `state`, `readiness`, `rollback`, and error
+    bodies are shared. `detail`, `source`, `target`, and `progress.unit` are
+    server-specific.
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness check
+      responses:
+        "200":
+          description: Server is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+
+  /v1/capabilities:
+    get:
+      summary: What this server can migrate
+      responses:
+        "200":
+          description: Capabilities
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Capabilities" }
+
+  /v1/preflight:
+    post:
+      summary: Check a migration request without changing anything
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EndpointsRequest" }
+      responses:
+        "200":
+          description: Check results. ok is false if any check failed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, checks]
+                properties:
+                  ok: { type: boolean }
+                  checks:
+                    type: array
+                    items: { $ref: "#/components/schemas/Check" }
+        "400": { $ref: "#/components/responses/Error" }
+
+  /v1/migrations:
+    post:
+      summary: Create a migration and start the initial sync
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EndpointsRequest" }
+      responses:
+        "202":
+          description: Created; the worker starts the initial sync
+          headers:
+            Location:
+              schema: { type: string, example: /v1/migrations/om-1a2b3c4d5e6f7a8b }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Migration" }
+        "400": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+
+  /v1/migrations/{id}:
+    parameters:
+      - $ref: "#/components/parameters/MigrationID"
+    get:
+      summary: Current state of a migration
+      responses:
+        "200":
+          description: Migration
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Migration" }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      summary: Abort a migration before switch
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "202": { $ref: "#/components/responses/Accepted" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+
+  /v1/migrations/{id}/{command}:
+    parameters:
+      - $ref: "#/components/parameters/MigrationID"
+      - name: command
+        in: path
+        required: true
+        description: |
+          freeze (READY), switch (FROZEN), resume (SWITCHED),
+          rollback (FROZEN, SWITCHED, RESUMED, VERIFYING while
+          rollback.allowed), finalize (VERIFYING after verification passed).
+        schema:
+          type: string
+          enum: [freeze, switch, resume, rollback, finalize]
+    post:
+      summary: Ask the worker to run a command
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CommandBody" }
+      responses:
+        "202": { $ref: "#/components/responses/Accepted" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+
+components:
+  parameters:
+    MigrationID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Repeating a request with the same key returns the first response,
+        marked with the header Idempotent-Replayed: true. Reusing a key for a
+        different request returns 422 IDEMPOTENCY_KEY_REUSED.
+      schema: { type: string }
+
+  responses:
+    Accepted:
+      description: Command recorded; the worker runs it next
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Migration" }
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Kind:
+      type: string
+      enum: [s3, gcs, seaweedfs]
+
+    Endpoint:
+      type: object
+      required: [kind, bucket, ref]
+      properties:
+        kind: { $ref: "#/components/schemas/Kind" }
+        bucket: { type: string }
+        url:
+          type: string
+          description: S3-compatible endpoint. Required for seaweedfs.
+        ref:
+          type: string
+          description: Reference to credentials in the secret store, never the secret itself.
+          example: env:AWS_SOURCE
+
+    EndpointsRequest:
+      type: object
+      required: [source, target]
+      additionalProperties: false
+      properties:
+        source: { $ref: "#/components/schemas/Endpoint" }
+        target: { $ref: "#/components/schemas/Endpoint" }
+
+    CommandBody:
+      type: object
+      additionalProperties: false
+      properties:
+        cutoverId:
+          type: string
+          description: Ties the commands of one cutover across servers.
+        deadlineMs:
+          type: integer
+          minimum: 0
+          description: For freeze. How long the server may hold the frozen state.
+
+    Phase:
+      type: string
+      enum:
+        - CREATED
+        - INITIAL_SYNC
+        - SYNCING
+        - READY
+        - FROZEN
+        - SWITCHED
+        - RESUMED
+        - VERIFYING
+        - COMPLETED
+        - ROLLING_BACK
+        - ROLLED_BACK
+        - FAILED
+        - ABORTED
+
+    State:
+      type: string
+      enum: [running, waiting, succeeded, failed, unknown]
+      description: unknown means the last action's outcome could not be confirmed; do not proceed automatically.
+
+    Check:
+      type: object
+      required: [name, ok]
+      properties:
+        name: { type: string }
+        ok: { type: boolean }
+        message: { type: string }
+
+    Migration:
+      type: object
+      required: [id, type, phase, state, source, target, progress, lag, readiness, rollback, lastError, version, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [object, db, cache] }
+        phase: { $ref: "#/components/schemas/Phase" }
+        state: { $ref: "#/components/schemas/State" }
+        detail: { type: string, description: Server-specific sub-step for dashboards. }
+        source: { $ref: "#/components/schemas/Endpoint" }
+        target: { $ref: "#/components/schemas/Endpoint" }
+        progress:
+          type: object
+          properties:
+            done: { type: integer }
+            total: { type: integer }
+            unit: { type: string }
+        lag:
+          type: object
+          properties:
+            seconds: { type: number }
+            items: { type: integer }
+        readiness:
+          type: object
+          required: [ready, checks]
+          properties:
+            ready: { type: boolean }
+            checks:
+              type: array
+              items: { $ref: "#/components/schemas/Check" }
+        rollback:
+          type: object
+          required: [allowed]
+          properties:
+            allowed: { type: boolean }
+            reason: { type: string }
+        pendingCommand:
+          type: object
+          properties:
+            command: { type: string, enum: [freeze, switch, resume, rollback, finalize, abort] }
+            idempotencyKey: { type: string }
+            cutoverId: { type: string }
+            deadlineMs: { type: integer }
+            requestedAt: { type: string, format: date-time }
+        lastError:
+          oneOf:
+            - type: "null"
+            - { $ref: "#/components/schemas/Error" }
+        version: { type: integer }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Capabilities:
+      type: object
+      properties:
+        type: { type: string }
+        engine: { type: string }
+        sourceKinds:
+          type: array
+          items: { $ref: "#/components/schemas/Kind" }
+        targetKinds:
+          type: array
+          items: { $ref: "#/components/schemas/Kind" }
+        commands:
+          type: array
+          items: { type: string }
+
+    Error:
+      type: object
+      required: [code, message, retryable]
+      properties:
+        code:
+          type: string
+          description: |
+            INVALID_ARGUMENT (400), NOT_FOUND (404), INVALID_PHASE (409),
+            COMMAND_PENDING (409), PRECONDITION_FAILED (409),
+            IDEMPOTENCY_KEY_REUSED (422), INTERNAL (500), ENGINE_ERROR (in lastError only)
+        message: { type: string }
+        retryable: { type: boolean }

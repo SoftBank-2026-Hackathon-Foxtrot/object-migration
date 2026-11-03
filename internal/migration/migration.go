@@ -203,6 +203,9 @@ var (
 	// ErrCommandPending means a different command is still waiting for the
 	// worker.
 	ErrCommandPending = errors.New("another command is pending")
+	// ErrPrecondition means the phase allows the command but the migration
+	// is not in a state to run it yet.
+	ErrPrecondition = errors.New("precondition failed")
 )
 
 // New returns a migration in CREATED with a fresh ID.
@@ -247,7 +250,10 @@ func (m *Migration) RequestCommand(req CommandRequest) error {
 		return fmt.Errorf("%w: cannot %s in %s", ErrInvalidPhase, req.Command, m.Phase)
 	}
 	if req.Command == CommandRollback && !m.Rollback.Allowed {
-		return fmt.Errorf("%w: rollback not allowed: %s", ErrInvalidPhase, m.Rollback.Reason)
+		return fmt.Errorf("%w: rollback not allowed: %s", ErrPrecondition, m.Rollback.Reason)
+	}
+	if req.Command == CommandFinalize && m.State != StateSucceeded {
+		return fmt.Errorf("%w: verification has not passed", ErrPrecondition)
 	}
 	r := req
 	m.Pending = &r

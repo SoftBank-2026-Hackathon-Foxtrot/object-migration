@@ -8,30 +8,50 @@ Design: [architecture](https://softbank-2026-hackathon-foxtrot.github.io/design-
 
 ## Status
 
-Early. The HTTP server exposes `GET /healthz`. Migration types, phase rules, and an in-memory store are in place; the common API and the worker are next.
+M1: the common API and the worker run the whole phase flow with a fake engine. No real copying yet; that starts in M2 with rclone.
 
 ## Run
 
 ```sh
-go run ./cmd/object-migration
-curl localhost:8080/healthz
+FAKE_STEP_DELAY=500ms go run ./cmd/object-migration
 ```
 
-`ADDR` sets the listen address (default `:8080`).
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ADDR` | `:8080` | Listen address |
+| `POLL_INTERVAL` | `2s` | How often a waiting migration rechecks, and the retry backoff |
+| `FAKE_STEP_DELAY` | `2s` | How long each fake engine step takes |
+
+Drive a migration with curl:
+
+```sh
+ID=$(curl -s -X POST localhost:8080/v1/migrations \
+  -d '{"source":{"kind":"s3","bucket":"src","ref":"env:AWS"},"target":{"kind":"gcs","bucket":"dst","ref":"env:GCP"}}' | jq -r .id)
+curl -s localhost:8080/v1/migrations/$ID | jq '{phase,state}'   # wait for READY
+curl -s -X POST localhost:8080/v1/migrations/$ID/freeze
+curl -s -X POST localhost:8080/v1/migrations/$ID/switch
+curl -s -X POST localhost:8080/v1/migrations/$ID/resume       # wait for VERIFYING/succeeded
+curl -s -X POST localhost:8080/v1/migrations/$ID/finalize
+```
+
+The API is described in [api/openapi.yaml](api/openapi.yaml).
 
 ## Test
 
 ```sh
-go test ./...
+go test -race ./...
 ```
 
 ## Layout
 
 | Path | Purpose |
 | --- | --- |
-| `cmd/object-migration` | Entry point |
-| `internal/api` | HTTP API |
+| `cmd/object-migration` | Entry point. Runs the API and the worker in one process |
+| `api/openapi.yaml` | Common API draft shared with the DB and cache migration servers |
+| `internal/api` | HTTP handlers, error mapping, Idempotency-Key replay |
+| `internal/worker` | Runs each migration through its phases, one goroutine per migration |
+| `internal/engine` | Storage work behind each phase. `Fake` for now |
 | `internal/migration` | Migration types, phases, and which commands each phase accepts. No I/O |
 | `internal/store` | Storage shared by the API and the worker. In-memory for now |
 
-Planned packages: `internal/worker` (runs phases), `internal/eventsource` (SQS, Pub/Sub, SeaweedFS change feeds), `internal/copier` (rclone), `internal/routing` (active bucket for app servers).
+Planned packages: `internal/copier` (rclone), `internal/eventsource` (SQS, Pub/Sub, SeaweedFS change feeds), `internal/routing` (active bucket for app servers).

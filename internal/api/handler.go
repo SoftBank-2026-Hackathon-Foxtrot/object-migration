@@ -1,20 +1,224 @@
-// Package api serves the HTTP API of the object migration server.
+// Package api serves the common migration API. Handlers validate a request,
+// record it in the store, wake the worker, and return at once; the worker
+// does the long-running work.
 package api
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
+	"time"
+
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 )
 
+// Notifier wakes the worker for a migration.
+type Notifier interface {
+	Notify(id string)
+}
+
+type Deps struct {
+	Store    store.Store
+	Notifier Notifier
+	// Engine is the engine name reported by /v1/capabilities.
+	Engine string
+	Logger *slog.Logger
+	Now    func() time.Time
+}
+
+type handler struct {
+	Deps
+	idem *idempotency
+}
+
+const maxBodyBytes = 1 << 20
+
 // NewHandler returns the HTTP handler with all routes registered.
-func NewHandler() http.Handler {
+func NewHandler(d Deps) http.Handler {
+	if d.Notifier == nil {
+		d.Notifier = nopNotifier{}
+	}
+	if d.Logger == nil {
+		d.Logger = slog.Default()
+	}
+	if d.Now == nil {
+		d.Now = time.Now
+	}
+	h := &handler{Deps: d, idem: newIdempotency()}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
+	mux.HandleFunc("GET /v1/capabilities", h.capabilities)
+	mux.HandleFunc("POST /v1/preflight", h.preflight)
+	mux.HandleFunc("POST /v1/migrations", h.idem.wrap(h.create))
+	mux.HandleFunc("GET /v1/migrations/{id}", h.get)
+	mux.HandleFunc("POST /v1/migrations/{id}/{command}", h.idem.wrap(h.command))
+	mux.HandleFunc("DELETE /v1/migrations/{id}", h.idem.wrap(h.abort))
 	return mux
 }
 
+type nopNotifier struct{}
+
+func (nopNotifier) Notify(string) {}
+
 func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+var allKinds = []migration.Kind{migration.KindS3, migration.KindGCS, migration.KindSeaweedFS}
+
+func (h *handler) capabilities(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"type":        migration.Type,
+		"engine":      h.Engine,
+		"sourceKinds": allKinds,
+		"targetKinds": allKinds,
+		"commands": []migration.Command{
+			migration.CommandFreeze, migration.CommandSwitch, migration.CommandResume,
+			migration.CommandRollback, migration.CommandFinalize, migration.CommandAbort,
+		},
+	})
+}
+
+type endpointsRequest struct {
+	Source migration.Endpoint `json:"source"`
+	Target migration.Endpoint `json:"target"`
+}
+
+// preflight only validates the request for now. Access checks against the
+// real buckets come with the rclone engine.
+func (h *handler) preflight(w http.ResponseWriter, r *http.Request) {
+	var req endpointsRequest
+	if err := decode(w, r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	checks := []migration.Check{
+		endpointCheck("source_valid", req.Source),
+		endpointCheck("target_valid", req.Target),
+	}
+	ok := true
+	for _, c := range checks {
+		ok = ok && c.OK
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": ok, "checks": checks})
+}
+
+func endpointCheck(name string, e migration.Endpoint) migration.Check {
+	if err := e.Validate(); err != nil {
+		return migration.Check{Name: name, OK: false, Message: err.Error()}
+	}
+	return migration.Check{Name: name, OK: true}
+}
+
+func (h *handler) create(w http.ResponseWriter, r *http.Request) {
+	var req endpointsRequest
+	if err := decode(w, r, &req); err != nil {
+		writeError(w, err)
+		return
+	}
+	m, err := migration.New(req.Source, req.Target, h.Now())
+	if err != nil {
+		writeError(w, badRequest(err.Error()))
+		return
+	}
+	m, err = h.Store.Create(r.Context(), m)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	h.Notifier.Notify(m.ID)
+	w.Header().Set("Location", "/v1/migrations/"+m.ID)
+	writeJSON(w, http.StatusAccepted, m)
+}
+
+func (h *handler) get(w http.ResponseWriter, r *http.Request) {
+	m, err := h.Store.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
+}
+
+// pathCommands are the commands sent as POST /v1/migrations/{id}/{command}.
+// Abort is sent as DELETE.
+var pathCommands = map[string]migration.Command{
+	"freeze":   migration.CommandFreeze,
+	"switch":   migration.CommandSwitch,
+	"resume":   migration.CommandResume,
+	"rollback": migration.CommandRollback,
+	"finalize": migration.CommandFinalize,
+}
+
+type commandBody struct {
+	CutoverID  string `json:"cutoverId"`
+	DeadlineMS int64  `json:"deadlineMs"`
+}
+
+func (h *handler) command(w http.ResponseWriter, r *http.Request) {
+	cmd, ok := pathCommands[r.PathValue("command")]
+	if !ok {
+		writeError(w, notFound(fmt.Sprintf("unknown command %q", r.PathValue("command"))))
+		return
+	}
+	var body commandBody
+	if err := decodeOptional(w, r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	if body.DeadlineMS < 0 {
+		writeError(w, badRequest("deadlineMs must not be negative"))
+		return
+	}
+	h.request(w, r, migration.CommandRequest{
+		Command:    cmd,
+		CutoverID:  body.CutoverID,
+		DeadlineMS: body.DeadlineMS,
+	})
+}
+
+func (h *handler) abort(w http.ResponseWriter, r *http.Request) {
+	h.request(w, r, migration.CommandRequest{Command: migration.CommandAbort})
+}
+
+func (h *handler) request(w http.ResponseWriter, r *http.Request, req migration.CommandRequest) {
+	req.IdempotencyKey = r.Header.Get(idempotencyHeader)
+	req.RequestedAt = h.Now()
+	m, err := h.Store.RequestCommand(r.Context(), r.PathValue("id"), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	h.Notifier.Notify(m.ID)
+	writeJSON(w, http.StatusAccepted, m)
+}
+
+// decode reads a required JSON body and rejects unknown fields.
+func decode(w http.ResponseWriter, r *http.Request, v any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return badRequest("invalid JSON body: " + err.Error())
+	}
+	if dec.More() {
+		return badRequest("invalid JSON body: trailing data")
+	}
+	return nil
+}
+
+// decodeOptional is decode that also accepts an empty body.
+func decodeOptional(w http.ResponseWriter, r *http.Request, v any) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
+		return badRequest("invalid JSON body: " + err.Error())
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

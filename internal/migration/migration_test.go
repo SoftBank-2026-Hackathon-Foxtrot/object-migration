@@ -64,6 +64,9 @@ func TestHappyPath(t *testing.T) {
 		{CommandFinalize, PhaseCompleted},
 	}
 	for _, s := range steps {
+		if s.cmd == CommandFinalize {
+			m.State = StateSucceeded // the worker sets this when verification passes
+		}
 		if s.cmd != "" {
 			if err := m.RequestCommand(CommandRequest{Command: s.cmd}); err != nil {
 				t.Fatalf("%s in %s: %v", s.cmd, m.Phase, err)
@@ -139,8 +142,21 @@ func TestRollbackBlockedWhenNotAllowed(t *testing.T) {
 	m.Phase = PhaseVerifying
 	m.Rollback = Rollback{Allowed: false, Reason: "reverse sync stopped"}
 	err := m.RequestCommand(CommandRequest{Command: CommandRollback})
-	if !errors.Is(err, ErrInvalidPhase) {
-		t.Fatalf("err = %v, want ErrInvalidPhase", err)
+	if !errors.Is(err, ErrPrecondition) {
+		t.Fatalf("err = %v, want ErrPrecondition", err)
+	}
+}
+
+func TestFinalizeNeedsPassedVerification(t *testing.T) {
+	m := newMigration(t)
+	m.Phase = PhaseVerifying
+	m.State = StateRunning
+	if err := m.RequestCommand(CommandRequest{Command: CommandFinalize}); !errors.Is(err, ErrPrecondition) {
+		t.Fatalf("err = %v, want ErrPrecondition", err)
+	}
+	m.State = StateSucceeded
+	if err := m.RequestCommand(CommandRequest{Command: CommandFinalize}); err != nil {
+		t.Fatal(err)
 	}
 }
 
