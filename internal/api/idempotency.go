@@ -2,33 +2,35 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"io"
 	"net/http"
 	"sync"
+
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 )
 
 const idempotencyHeader = "Idempotency-Key"
 
 // idempotency replays the first response for a repeated Idempotency-Key, so a
 // retried request gets the same answer even after the worker has moved on.
-// Keys live in memory until the store becomes persistent.
+// The responses are kept with the migrations, so a restart keeps them too.
 type idempotency struct {
+	saved responses
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
-	saved map[string]savedResponse
 }
 
-type savedResponse struct {
-	fingerprint [32]byte
-	status      int
-	location    string
-	body        []byte
+// responses keeps the saved responses; every store does.
+type responses interface {
+	SavedResponse(ctx context.Context, key string) (store.SavedResponse, bool, error)
+	SaveResponse(ctx context.Context, key string, r store.SavedResponse) error
 }
 
-func newIdempotency() *idempotency {
-	return &idempotency{locks: make(map[string]*sync.Mutex), saved: make(map[string]savedResponse)}
+func newIdempotency(saved responses) *idempotency {
+	return &idempotency{saved: saved, locks: make(map[string]*sync.Mutex)}
 }
 
 // wrap applies idempotency to next when the request carries a key.
@@ -53,8 +55,13 @@ func (i *idempotency) wrap(next http.HandlerFunc) http.HandlerFunc {
 		lock.Lock()
 		defer lock.Unlock()
 
-		if s, ok := i.get(key); ok {
-			if s.fingerprint != fp {
+		s, ok, err := i.saved.SavedResponse(r.Context(), key)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if ok {
+			if s.Fingerprint != fp {
 				writeError(w, &apiError{
 					Code:    "IDEMPOTENCY_KEY_REUSED",
 					Message: "Idempotency-Key was already used for a different request",
@@ -62,20 +69,23 @@ func (i *idempotency) wrap(next http.HandlerFunc) http.HandlerFunc {
 				})
 				return
 			}
-			if s.location != "" {
-				w.Header().Set("Location", s.location)
+			if s.Location != "" {
+				w.Header().Set("Location", s.Location)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Idempotent-Replayed", "true")
-			w.WriteHeader(s.status)
-			_, _ = w.Write(s.body)
+			w.WriteHeader(s.Status)
+			_, _ = w.Write(s.Body)
 			return
 		}
 
 		rec := &recorder{ResponseWriter: w, status: http.StatusOK}
 		next(rec, r)
 		if !retryable(rec.status, rec.body.Bytes()) {
-			i.put(key, savedResponse{fingerprint: fp, status: rec.status, location: w.Header().Get("Location"), body: rec.body.Bytes()})
+			saved := store.SavedResponse{Fingerprint: fp, Status: rec.status, Location: w.Header().Get("Location"), Body: rec.body.Bytes()}
+			// The request already took effect; a key that could not be
+			// saved only means a retry is not replayed.
+			_ = i.saved.SaveResponse(context.WithoutCancel(r.Context()), key, saved)
 		}
 	}
 }
@@ -104,19 +114,6 @@ func (i *idempotency) lockFor(key string) *sync.Mutex {
 		i.locks[key] = l
 	}
 	return l
-}
-
-func (i *idempotency) get(key string) (savedResponse, bool) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	s, ok := i.saved[key]
-	return s, ok
-}
-
-func (i *idempotency) put(key string, s savedResponse) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	i.saved[key] = s
 }
 
 // recorder passes the response through and keeps a copy.

@@ -13,9 +13,14 @@ import (
 // Apps records, per migration, the route generation each app reported
 // when it last asked for its route. An app that has not asked for longer
 // than the TTL is taken to be gone and is not waited for.
+//
+// Reports are not kept across restarts. For one TTL after it starts, Apps
+// waits for apps it has not heard from yet: an app still using its route
+// asks again within that time, since its lease lasts at most half of it.
 type Apps struct {
-	ttl time.Duration
-	now func() time.Time
+	ttl     time.Duration
+	now     func() time.Time
+	started time.Time
 
 	mu   sync.Mutex
 	seen map[string]map[string]report
@@ -27,7 +32,7 @@ type report struct {
 }
 
 func NewApps(ttl time.Duration) *Apps {
-	return &Apps{ttl: ttl, now: time.Now, seen: make(map[string]map[string]report)}
+	return &Apps{ttl: ttl, now: time.Now, started: time.Now(), seen: make(map[string]map[string]report)}
 }
 
 // TTL is how long an app may go without asking before it is not waited for.
@@ -45,8 +50,12 @@ func (a *Apps) Report(migration, app string, applied int64) {
 	apps[app] = report{applied: applied, at: a.now()}
 }
 
+// Unheard stands for the apps not heard from since the server started,
+// which Waiting lists during the first TTL.
+const Unheard = "(apps not heard from since the server started)"
+
 // Waiting returns the live apps that have not applied generation gen yet,
-// sorted by name.
+// sorted by name, and Unheard during the first TTL.
 func (a *Apps) Waiting(migration string, gen int64) []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -57,6 +66,9 @@ func (a *Apps) Waiting(migration string, gen int64) []string {
 		}
 	}
 	slices.Sort(waiting)
+	if a.now().Sub(a.started) <= a.ttl {
+		waiting = append(waiting, Unheard)
+	}
 	return waiting
 }
 

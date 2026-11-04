@@ -11,12 +11,13 @@ import (
 // Memory is a Store that keeps migrations in process memory. State is lost on
 // restart, so it is for tests and local runs.
 type Memory struct {
-	mu   sync.Mutex
-	byID map[string]migration.Migration
+	mu        sync.Mutex
+	byID      map[string]migration.Migration
+	responses map[string]SavedResponse
 }
 
 func NewMemory() *Memory {
-	return &Memory{byID: make(map[string]migration.Migration)}
+	return &Memory{byID: make(map[string]migration.Migration), responses: make(map[string]SavedResponse)}
 }
 
 func (s *Memory) Create(_ context.Context, m migration.Migration) (migration.Migration, error) {
@@ -91,4 +92,20 @@ func (s *Memory) ListActive(_ context.Context) ([]migration.Migration, error) {
 
 func samePending(a, b migration.CommandRequest) bool {
 	return a.Command == b.Command && a.IdempotencyKey == b.IdempotencyKey && a.RequestedAt.Equal(b.RequestedAt)
+}
+
+func (s *Memory) SavedResponse(_ context.Context, key string) (SavedResponse, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r, ok := s.responses[key]
+	return r, ok, nil
+}
+
+func (s *Memory) SaveResponse(_ context.Context, key string, r SavedResponse) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.responses[key]; !ok {
+		s.responses[key] = r
+	}
+	return nil
 }

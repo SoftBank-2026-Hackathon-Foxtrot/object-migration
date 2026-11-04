@@ -31,6 +31,7 @@ type SeaweedFSConfig struct {
 // which streams every change under a path from a given time. Nothing is set
 // up on the SeaweedFS side; the feed lives in this process and, after a
 // lost connection, resumes from the oldest change not yet acknowledged.
+// Position tells where that is, so a restarted process can resume there.
 type SeaweedFS struct {
 	cfg    SeaweedFSConfig
 	prefix string // the bucket's directory in the filer, with a trailing slash
@@ -66,7 +67,8 @@ func NewSeaweedFS(cfg SeaweedFSConfig) *SeaweedFS {
 	}
 }
 
-// Subscribe starts following changes from now, unless it already runs.
+// Subscribe starts following changes from the position given to
+// ResumeFrom, or from now, unless it already runs.
 func (s *SeaweedFS) Subscribe(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -89,6 +91,26 @@ func (s *SeaweedFS) Subscribe(ctx context.Context) error {
 		defer conn.Close()
 		s.follow(run, conn)
 	}()
+	return nil
+}
+
+// Position is the resume point: every change after it that was read is
+// either acknowledged or still waiting. It is nanoseconds since 1970.
+func (s *SeaweedFS) Position() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strconv.FormatInt(s.since, 10)
+}
+
+// ResumeFrom makes Subscribe start after pos, a Position saved earlier.
+func (s *SeaweedFS) ResumeFrom(pos string) error {
+	since, err := strconv.ParseInt(pos, 10, 64)
+	if err != nil || since <= 0 {
+		return fmt.Errorf("bad position %q", pos)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.since = since
 	return nil
 }
 

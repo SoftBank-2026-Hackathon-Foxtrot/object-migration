@@ -20,6 +20,14 @@ Apps switch between AWS S3, GCS and on-prem SeaweedFS, or back, without a failed
 | GCS → S3 | Pub/Sub | 1,980 | 0 |
 | GCS → SeaweedFS | Pub/Sub | 3,426 | 0 |
 
+Restarts: the server was killed with SIGKILL during the initial copy, while following changes, and between switch and resume, and started again each time, with apps working throughout:
+
+| Direction | Change feed | Requests | Failed | Missing | Deleted left |
+| --- | --- | --- | --- | --- | --- |
+| SeaweedFS → GCS | filer subscription, resumed from the saved position | 20,122 | 0 | 0 | 0 |
+| GCS → SeaweedFS | Pub/Sub | 8,553 | 0 | 0 | 0 |
+| SeaweedFS → SeaweedFS | filer subscription, resumed from the saved position | 4,179 | 0 | 0 | 0 |
+
 `scripts/scenario.sh` runs one direction end to end; `/v1/capabilities` lists every direction with its change feed and how objects are compared.
 
 How a migration runs:
@@ -37,6 +45,14 @@ How a migration runs:
 Apps record each key they delete with the server before deleting it from the buckets; every copy the server makes, in either direction, removes its copy of a recorded key. A copy and a delete can then finish in either order. Apps report a route as applied only once no request on an older one is running, and stop serving when they cannot refresh the route for 5 seconds during a migration, so the server never moves on while an app may still write where the old route said.
 
 A switch or finalize that waits for an app that never confirms leaves the migration `unknown`; `rollback` may then replace it.
+
+**Restarts.** With `DATABASE_URL` set, the server keeps in PostgreSQL every migration (phase, route generation, pending command), the keys apps deleted, the SeaweedFS feed's position, and the responses replayed for `Idempotency-Key`. A server that stopped, even killed mid-step, picks up every unfinished migration on start and runs its current step again:
+
+- The initial copy continues: objects already in the target are compared, not copied again.
+- SQS queues and Pub/Sub subscriptions held the changes meanwhile; the SeaweedFS feed reads again from the saved position. The first round after a restart copies the whole source and removes every key apps deleted so far, in case a copy cut short brought one back.
+- A route step waits one `APP_TTL` before it trusts that it has heard from every app, since app reports are not kept. Apps keep working on their 5-second lease through a restart of a few seconds, and their deletes retry the record with the server meanwhile; through a longer one their requests fail until the server is back.
+
+Run one server per database: app reports live in the process.
 
 Change feeds: an S3 source through SQS, a GCS source through Pub/Sub (set `GCP_PROJECT` to the platform's project, which holds the topic; the bucket's storage service agent needs `roles/pubsub.publisher` there, which the server grants on the topic when it may), a SeaweedFS source through its filer's metadata subscription (give the endpoint `filer`, the filer's gRPC address). The SeaweedFS feed needs nothing set up on the SeaweedFS side and resumes from the oldest change not yet handled after a lost connection. Sources without a feed (gcs when `GCP_PROJECT` is unset, seaweedfs without `filer`) are mirrored in full every `SYNC_INTERVAL` before the switch. S3 sends each object event to one destination, so a source bucket that already sends object events elsewhere (a Lambda, SNS topic or queue) cannot be followed; preflight reports it as `source_events`.
 
@@ -91,6 +107,7 @@ ENGINE=fake FAKE_STEP_DELAY=500ms go run ./cmd/object-migration
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ADDR` | `:8080` | Listen address |
+| `DATABASE_URL` | | PostgreSQL URL, e.g. `postgres://user:pass@host:5432/db`. The server creates its tables. Unset: state lives in memory and is lost on restart |
 | `ENGINE` | `rclone` | `rclone` copies real objects; `fake` only pretends |
 | `POLL_INTERVAL` | `2s` | How often a waiting migration rechecks, and the retry backoff |
 | `SYNC_INTERVAL` | `30s` (`2s` with fake) | Wait between sync rounds for sources without a change feed. Each such round lists both buckets |
@@ -130,6 +147,13 @@ The API is described in [api/openapi.yaml](api/openapi.yaml); what an app's stor
 go test -race ./...
 ```
 
+The store tests also run against PostgreSQL when `OM_POSTGRES_URL` names a database they may empty:
+
+```sh
+docker run -d --name om-postgres -e POSTGRES_USER=om -e POSTGRES_PASSWORD=om -e POSTGRES_DB=om -p 55432:5432 postgres:17-alpine
+OM_POSTGRES_URL='postgres://om:om@127.0.0.1:55432/om?sslmode=disable' go test -race ./internal/store
+```
+
 ## Layout
 
 | Path | Purpose |
@@ -147,6 +171,6 @@ go test -race ./...
 | `internal/e2e` | API, worker and apps together on in-memory buckets |
 | `internal/creds` | Resolves endpoint credential references |
 | `internal/migration` | Migration types, phases, and which commands each phase accepts. No I/O |
-| `internal/store` | Storage shared by the API and the worker. In-memory for now |
+| `internal/store` | Storage shared by the API and the worker: PostgreSQL, or memory for tests and local runs |
 
-Not yet: restart recovery (state is in memory; M7), metrics and server-to-server authentication (M8).
+Not yet: metrics and server-to-server authentication (M8).

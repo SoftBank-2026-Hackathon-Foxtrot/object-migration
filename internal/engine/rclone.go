@@ -44,6 +44,10 @@ type Rclone struct {
 	// however the copy and the delete interleaved. Nil means apps record
 	// none.
 	Deletes *routing.Deletes
+	// Positions keeps where each feed that resumes from a position was read
+	// up to, so a restarted server goes on from there. Nil starts such
+	// feeds a little before now.
+	Positions Positions
 	// PreflightTimeout bounds each preflight check.
 	PreflightTimeout time.Duration
 
@@ -66,6 +70,23 @@ type Feed interface {
 	eventsource.Source
 	Subscribe(ctx context.Context) error
 	Unsubscribe(ctx context.Context) error
+}
+
+// Positions keeps change feed positions by migration.
+type Positions interface {
+	FeedPosition(ctx context.Context, id string) (string, error)
+	SaveFeedPosition(ctx context.Context, id, pos string) error
+	ForgetFeedPosition(ctx context.Context, id string) error
+}
+
+// Resumable is a feed that reads from a position the server keeps, rather
+// than one that holds unhandled changes itself like a queue.
+type Resumable interface {
+	// Position is where reading can start again without losing an
+	// unacknowledged change.
+	Position() string
+	// ResumeFrom sets where Subscribe starts reading.
+	ResumeFrom(pos string) error
 }
 
 // StreamOptions tune how a migration with a change feed follows the source
@@ -110,10 +131,12 @@ func DefaultStreamOptions() StreamOptions {
 }
 
 // stream is what the engine keeps in memory about a migration with a feed.
-// It is rebuilt after a restart; the feed itself keeps the changes.
+// It is rebuilt after a restart; the feed itself keeps the changes, or
+// Positions keeps where to read them from again.
 type stream struct {
 	feed       Feed
 	subscribed bool
+	savedPos   string // the feed position last saved
 
 	lastFull time.Time
 
@@ -233,7 +256,12 @@ func (r *Rclone) stream(ctx context.Context, m migration.Migration) (*stream, er
 		if err != nil {
 			return nil, feedError(err)
 		}
-		st = &stream{feed: feed}
+		// A copy cut short by a restart may have brought back keys apps
+		// deleted; the next round removes every key deleted so far.
+		st = &stream{feed: feed, unapplied: m.CreatedAt}
+		if err := r.resumeFeed(ctx, m.ID, st); err != nil {
+			return nil, err
+		}
 		r.mu.Lock()
 		r.streams[m.ID] = st
 		r.mu.Unlock()
@@ -245,6 +273,45 @@ func (r *Rclone) stream(ctx context.Context, m migration.Migration) (*stream, er
 		st.subscribed = true
 	}
 	return st, nil
+}
+
+// resumeFeed points a resumable feed at its saved position.
+func (r *Rclone) resumeFeed(ctx context.Context, id string, st *stream) error {
+	feed, ok := st.feed.(Resumable)
+	if !ok || r.Positions == nil {
+		return nil
+	}
+	pos, err := r.Positions.FeedPosition(ctx, id)
+	if err != nil {
+		return fmt.Errorf("load feed position: %w", err)
+	}
+	if pos == "" {
+		return nil
+	}
+	if err := feed.ResumeFrom(pos); err != nil {
+		return fmt.Errorf("resume feed from %q: %w", pos, err)
+	}
+	st.savedPos = pos
+	r.Log.Info("change feed resumes from its saved position", "migration", id, "position", pos)
+	return nil
+}
+
+// savePosition saves a resumable feed's position if it moved. A position
+// that could not be saved only makes a restart read some changes again.
+func (r *Rclone) savePosition(ctx context.Context, id string, st *stream) {
+	feed, ok := st.feed.(Resumable)
+	if !ok || r.Positions == nil {
+		return
+	}
+	pos := feed.Position()
+	if pos == st.savedPos {
+		return
+	}
+	if err := r.Positions.SaveFeedPosition(ctx, id, pos); err != nil {
+		r.Log.Warn("save feed position", "migration", id, "err", err)
+		return
+	}
+	st.savedPos = pos
 }
 
 func feedError(err error) error {
@@ -370,10 +437,17 @@ func (r *Rclone) Release(ctx context.Context, m migration.Migration) error {
 			return fmt.Errorf("remove canaries: %w", err)
 		}
 	}
+	if r.Positions != nil {
+		if err := r.Positions.ForgetFeedPosition(ctx, m.ID); err != nil {
+			return fmt.Errorf("forget feed position: %w", err)
+		}
+	}
+	if err := r.Deletes.Forget(ctx, m.ID); err != nil {
+		return fmt.Errorf("forget deleted keys: %w", err)
+	}
 	r.mu.Lock()
 	delete(r.streams, m.ID)
 	r.mu.Unlock()
-	r.Deletes.Forget(m.ID)
 	return nil
 }
 
@@ -587,7 +661,16 @@ func (r *Rclone) Resume(ctx context.Context, m migration.Migration) error {
 	if _, err := copier.Copy(ctx, src, dst, r.Options, nil); err != nil {
 		return fmt.Errorf("final copy: %w", err)
 	}
-	return r.applyDeletes(ctx, m.ID, dst, start)
+	// After a restart, also remove what a copy cut short by it brought back.
+	since := start
+	if !st.unapplied.IsZero() && st.unapplied.Before(since) {
+		since = st.unapplied
+	}
+	if err := r.applyDeletes(ctx, m.ID, dst, since); err != nil {
+		return err
+	}
+	st.unapplied = time.Time{}
+	return nil
 }
 
 // Rollback runs once every app writes to the source again and still reads
@@ -643,6 +726,17 @@ func (r *Rclone) copyBack(ctx context.Context, id string, src, dst fs.Fs) (int64
 		wg.Go(func() {
 			slots <- struct{}{}
 			defer func() { <-slots }()
+			if r.Deletes.Has(id, key) {
+				// An app deleted it: from the target first, so either that
+				// delete is under way or a copy cut short by a restart
+				// brought the key back. It goes from both.
+				if err := errors.Join(copier.Delete(ctx, dst, key), copier.Delete(ctx, src, key)); err != nil {
+					mu.Lock()
+					first = cmp.Or(first, fmt.Errorf("remove deleted %q: %w", key, err))
+					mu.Unlock()
+				}
+				return
+			}
 			for pass := range 2 {
 				act, err := r.syncKey(ctx, id, dst, src, key)
 				if err != nil {

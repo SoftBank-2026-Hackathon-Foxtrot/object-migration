@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"context"
 	"slices"
 	"sync"
 	"time"
@@ -12,18 +13,45 @@ import (
 // and a delete can then happen in any order: the copy is removed whichever
 // finishes last.
 type Deletes struct {
+	log DeleteLog
 	now func() time.Time
 
 	mu   sync.Mutex
 	keys map[string]map[string]time.Time // when each key was recorded
 }
 
+// DeleteLog keeps the recorded keys across restarts.
+type DeleteLog interface {
+	RecordDeletes(ctx context.Context, migration string, keys []string, at time.Time) error
+	LoadDeletes(ctx context.Context) (map[string]map[string]time.Time, error)
+	ForgetDeletes(ctx context.Context, migration string) error
+}
+
 func NewDeletes() *Deletes {
 	return &Deletes{now: time.Now, keys: make(map[string]map[string]time.Time)}
 }
 
-// Add records that apps deleted keys of a migration.
-func (d *Deletes) Add(migration string, keys ...string) {
+// LoadDeletes returns Deletes that saves every key to log, starting with
+// the keys log already holds.
+func LoadDeletes(ctx context.Context, log DeleteLog) (*Deletes, error) {
+	keys, err := log.LoadDeletes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	d := NewDeletes()
+	d.log, d.keys = log, keys
+	return d, nil
+}
+
+// Add records that apps deleted keys of a migration. The keys are saved
+// before Add returns, since the app deletes them once it does.
+func (d *Deletes) Add(ctx context.Context, migration string, keys ...string) error {
+	at := d.now()
+	if d.log != nil {
+		if err := d.log.RecordDeletes(ctx, migration, keys, at); err != nil {
+			return err
+		}
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	m, ok := d.keys[migration]
@@ -33,9 +61,10 @@ func (d *Deletes) Add(migration string, keys ...string) {
 	}
 	for _, k := range keys {
 		if _, seen := m[k]; !seen {
-			m[k] = d.now()
+			m[k] = at
 		}
 	}
+	return nil
 }
 
 // Has reports whether apps deleted key during the migration.
@@ -69,11 +98,17 @@ func (d *Deletes) Since(migration string, t time.Time) []string {
 }
 
 // Forget drops a migration's deleted keys once it is over.
-func (d *Deletes) Forget(migration string) {
+func (d *Deletes) Forget(ctx context.Context, migration string) error {
 	if d == nil {
-		return
+		return nil
+	}
+	if d.log != nil {
+		if err := d.log.ForgetDeletes(ctx, migration); err != nil {
+			return err
+		}
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	delete(d.keys, migration)
+	return nil
 }

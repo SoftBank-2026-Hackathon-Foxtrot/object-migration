@@ -11,6 +11,7 @@ func TestWaitingAndWait(t *testing.T) {
 	a := NewApps(time.Second)
 	now := time.Unix(1000, 0)
 	a.now = func() time.Time { return now }
+	a.started = now.Add(-2 * time.Second)
 
 	a.Report("m1", "web-1", 1)
 	a.Report("m1", "web-2", 2)
@@ -48,22 +49,47 @@ func TestDeletes(t *testing.T) {
 	d := NewDeletes()
 	now := time.Unix(1000, 0)
 	d.now = func() time.Time { return now }
-	d.Add("m1", "b", "a")
-	d.Add("m2", "c")
+	ctx := context.Background()
+	add := func(m string, keys ...string) {
+		if err := d.Add(ctx, m, keys...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	add("m1", "b", "a")
+	add("m2", "c")
 	now = now.Add(time.Minute)
-	d.Add("m1", "d", "a") // a keeps its first time
+	add("m1", "d", "a") // a keeps its first time
 	if !d.Has("m1", "a") || d.Has("m1", "c") || !slices.Equal(d.Since("m1", time.Time{}), []string{"a", "b", "d"}) {
 		t.Fatalf("keys = %v", d.Since("m1", time.Time{}))
 	}
 	if got := d.Since("m1", now); !slices.Equal(got, []string{"d"}) {
 		t.Fatalf("since now = %v", got)
 	}
-	d.Forget("m1")
+	if err := d.Forget(ctx, "m1"); err != nil {
+		t.Fatal(err)
+	}
 	if d.Has("m1", "a") || !d.Has("m2", "c") {
 		t.Fatal("forget")
 	}
 	var none *Deletes
 	if none.Has("m", "k") || none.Since("m", time.Time{}) != nil {
 		t.Fatal("nil Deletes must know nothing")
+	}
+}
+
+func TestWaitingAfterStart(t *testing.T) {
+	a := NewApps(time.Second)
+	now := time.Unix(1000, 0)
+	a.now = func() time.Time { return now }
+	a.started = now
+	// Right after a start no app has reported yet, but one may still use
+	// an older route.
+	if got := a.Waiting("m1", 2); !slices.Equal(got, []string{Unheard}) {
+		t.Fatalf("waiting at start = %v", got)
+	}
+	a.Report("m1", "web-1", 2)
+	now = now.Add(1500 * time.Millisecond)
+	if got := a.Waiting("m1", 2); len(got) != 0 {
+		t.Fatalf("waiting after one TTL = %v", got)
 	}
 }

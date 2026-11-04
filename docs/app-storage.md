@@ -31,9 +31,9 @@ GET /v1/migrations/{id}/routing?app={name}&applied={generation}
 The response never holds credentials; the app reaches each bucket with its own.
 
 1. Ask once at start-up, before serving requests.
-2. Ask again every second, passing `applied`.
+2. Ask again every second, passing `applied`; after a failed ask, ask again within 200 ms.
 3. When the generation changed, use the new route for every request that starts from now on, then ask once more at once, so the server learns without waiting a second. A route step waits for every app that asked in the last 10 seconds (`APP_TTL`).
-4. **Lease.** While the migration runs (phase not `COMPLETED`, `ROLLED_BACK`, `ABORTED` or `FAILED`), fail every request once the route has not been refreshed for 5 seconds. After 10 seconds the server stops waiting for an app it cannot hear, and the others may move on; an app still using the old route could then write where no one reads. The lease must stay shorter than `APP_TTL`. Once the migration is over the route no longer changes and needs no lease.
+4. **Lease.** While the migration runs (phase not `COMPLETED`, `ROLLED_BACK`, `ABORTED` or `FAILED`), fail every request once the route has not been refreshed for 5 seconds. After 10 seconds the server stops waiting for an app it cannot hear, and the others may move on; an app still using the old route could then write where no one reads. The lease must stay shorter than `APP_TTL`; a restarted server waits one `APP_TTL` before moving apps, so every app still serving has asked by then. Once the migration is over the route no longer changes and needs no lease.
 5. Use a route only once every bucket in it can be reached.
 
 ## Requests
@@ -42,7 +42,7 @@ The response never holds credentials; the app reaches each bucket with its own.
 | --- | --- |
 | Write | Put the object in `write`. |
 | Read | Try `read` in order. Not found in one bucket means try the next; not found in all of them means not found. Any other error is an error. |
-| Delete | If `delete` lists more than one bucket, first `POST /v1/migrations/{id}/deletes` with `{"keys": ["<key>"]}` and expect `204`; if that fails, fail the delete. Then delete from every bucket in `delete`, in order. A bucket that does not hold the key is not an error. |
+| Delete | If `delete` lists more than one bucket, first `POST /v1/migrations/{id}/deletes` with `{"keys": ["<key>"]}` and expect `204`. Retry a network error or `5xx` while the lease lasts, so a server restart does not fail the delete; if it still fails, fail the delete. Then delete from every bucket in `delete`, in order. A bucket that does not hold the key is not an error. |
 
 Recording the key first lets the migration server remove any copy of it that a copy running at the same time makes, whichever finishes last. It also means a delete that fails half way may still take effect: the server finishes it. Treat a failed delete as "maybe deleted" and retry it.
 

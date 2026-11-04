@@ -191,31 +191,109 @@ type harness struct {
 	srv      *httptest.Server
 	src, dst *bucket
 	id       string
+
+	// What outlives a server restart.
+	st      *store.Memory
+	deleted *deleteLog
+
+	handler atomic.Pointer[http.Handler] // nil while the server is down
+	down    func()
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{t: t, src: newBucket(), dst: newBucket()}
-	st := store.NewMemory()
-	apps := routing.NewApps(time.Second)
-	deletes := routing.NewDeletes()
-	eng := &mapEngine{Fake: engine.NewFake(time.Millisecond), src: h.src, dst: h.dst, deletes: deletes}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	w := worker.New(st, eng, worker.Config{
-		PollInterval: 5 * time.Millisecond, RetryBackoff: 5 * time.Millisecond, SyncInterval: 5 * time.Millisecond,
-		Apps: apps, ConfirmTimeout: 5 * time.Second,
-	}, log)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { _ = w.Run(ctx); close(done) }()
-	h.srv = httptest.NewServer(api.NewHandler(api.Deps{Store: st, Notifier: w, Engine: "map", Apps: apps, Deletes: deletes, Logger: log}))
-	t.Cleanup(func() { h.srv.Close(); cancel(); <-done })
+	h := &harness{t: t, src: newBucket(), dst: newBucket(), st: store.NewMemory(), deleted: &deleteLog{}}
+	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hd := h.handler.Load()
+		if hd == nil {
+			http.Error(w, "restarting", http.StatusServiceUnavailable)
+			return
+		}
+		(*hd).ServeHTTP(w, r)
+	}))
+	h.start()
+	t.Cleanup(func() { h.srv.Close(); h.down() })
 
 	body, _ := json.Marshal(map[string]any{"source": srcEP, "target": dstEP})
 	var m migration.Migration
 	h.call(http.MethodPost, "/v1/migrations", string(body), &m)
 	h.id = m.ID
 	return h
+}
+
+// start runs the API and the worker the way a fresh process does: with the
+// harness's store and deleted keys, and no app reports.
+func (h *harness) start() {
+	h.t.Helper()
+	apps := routing.NewApps(time.Second)
+	deletes, err := routing.LoadDeletes(context.Background(), h.deleted)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	eng := &mapEngine{Fake: engine.NewFake(time.Millisecond), src: h.src, dst: h.dst, deletes: deletes, id: h.id}
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := worker.New(h.st, eng, worker.Config{
+		PollInterval: 5 * time.Millisecond, RetryBackoff: 5 * time.Millisecond, SyncInterval: 5 * time.Millisecond,
+		Apps: apps, ConfirmTimeout: 5 * time.Second,
+	}, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = w.Run(ctx); close(done) }()
+	var hd http.Handler = api.NewHandler(api.Deps{Store: h.st, Notifier: w, Engine: "map", Apps: apps, Deletes: deletes, Logger: log})
+	h.handler.Store(&hd)
+	h.down = func() { h.handler.Store(nil); cancel(); <-done }
+}
+
+// restart stops the server, wherever it is in its work, and starts a new
+// one a moment later.
+func (h *harness) restart() {
+	h.t.Helper()
+	h.down()
+	time.Sleep(100 * time.Millisecond)
+	h.start()
+}
+
+// deleteLog keeps deleted keys across restarts, like the database.
+type deleteLog struct {
+	mu   sync.Mutex
+	keys map[string]map[string]time.Time
+}
+
+func (d *deleteLog) RecordDeletes(_ context.Context, id string, keys []string, at time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.keys == nil {
+		d.keys = map[string]map[string]time.Time{}
+	}
+	if d.keys[id] == nil {
+		d.keys[id] = map[string]time.Time{}
+	}
+	for _, k := range keys {
+		if _, ok := d.keys[id][k]; !ok {
+			d.keys[id][k] = at
+		}
+	}
+	return nil
+}
+
+func (d *deleteLog) LoadDeletes(context.Context) (map[string]map[string]time.Time, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := map[string]map[string]time.Time{}
+	for id, keys := range d.keys {
+		out[id] = map[string]time.Time{}
+		for k, at := range keys {
+			out[id][k] = at
+		}
+	}
+	return out, nil
+}
+
+func (d *deleteLog) ForgetDeletes(_ context.Context, id string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.keys, id)
+	return nil
 }
 
 func (h *harness) call(method, path, body string, out any) {
@@ -520,5 +598,51 @@ func TestRollbackReplacesASwitchStuckOnAnApp(t *testing.T) {
 	// never moved writes to the target.
 	if done.Routing.Write != migration.SideSource || len(done.Routing.Delete) != 1 || done.Routing.Generation != 4 {
 		t.Fatalf("route after rollback: %+v", done.Routing)
+	}
+}
+
+func TestRestartsDuringTheSwitch(t *testing.T) {
+	h := newHarness(t)
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	l, wg := h.startApps(ctx, 3)
+
+	h.waitPhase(migration.PhaseReady)
+	h.restart()
+	h.command("freeze")
+	h.waitPhase(migration.PhaseFrozen)
+	// Stopped while it moves apps: the new server goes on from the step
+	// the route is on, once every app has had time to report again.
+	h.command("switch")
+	h.restart()
+	h.waitPhase(migration.PhaseSwitched)
+	time.Sleep(50 * time.Millisecond)
+	h.restart() // between switch and resume
+	h.command("resume")
+	h.restart()
+	h.wait("verified", func(m migration.Migration) bool {
+		return m.Phase == migration.PhaseVerifying && m.State == migration.StateSucceeded
+	})
+	h.command("finalize")
+	h.restart()
+	done := h.waitPhase(migration.PhaseCompleted)
+	if done.Routing.Generation != 5 || done.Routing.Write != migration.SideTarget || len(done.Routing.Delete) != 1 {
+		t.Fatalf("route after finalize: %+v", done.Routing)
+	}
+	time.Sleep(50 * time.Millisecond)
+	stop()
+	wg.Wait()
+
+	// Each restart was shorter than an app's lease, so apps kept working.
+	l.report(t)
+	for _, k := range l.live {
+		if !h.dst.has(k) {
+			t.Fatalf("object %s written with success is not in the target", k)
+		}
+	}
+	for _, k := range l.deleted {
+		if h.dst.has(k) {
+			t.Fatalf("deleted object %s is in the target", k)
+		}
 	}
 }

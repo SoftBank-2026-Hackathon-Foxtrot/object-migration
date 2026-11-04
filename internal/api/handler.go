@@ -67,7 +67,11 @@ func NewHandler(d Deps) http.Handler {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
-	h := &handler{Deps: d, idem: newIdempotency()}
+	saved, ok := d.Store.(responses)
+	if !ok {
+		saved = store.NewMemory()
+	}
+	h := &handler{Deps: d, idem: newIdempotency(saved)}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
@@ -257,7 +261,10 @@ func (h *handler) deletes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.Deletes != nil {
-		h.Deletes.Add(m.ID, body.Keys...)
+		if err := h.Deletes.Add(r.Context(), m.ID, body.Keys...); err != nil {
+			writeError(w, err)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

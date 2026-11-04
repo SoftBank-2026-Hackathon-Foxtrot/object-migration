@@ -60,12 +60,18 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	st := store.NewMemory()
+	st, deletes, closeStore, err := openStore(logger)
+	if err != nil {
+		return err
+	}
+	defer closeStore()
 	apps := routing.NewApps(appTTL)
-	deletes := routing.NewDeletes()
 	var directions any
 	if r, ok := eng.(*engine.Rclone); ok {
 		r.Deletes = deletes
+		if pg, ok := st.(*store.Postgres); ok {
+			r.Positions = pg
+		}
 		directions = r.Directions()
 	}
 	w := worker.New(st, eng, worker.Config{
@@ -120,6 +126,28 @@ func run(logger *slog.Logger) error {
 	err = srv.Shutdown(shutdownCtx)
 	<-workerDone
 	return err
+}
+
+// openStore keeps migrations in PostgreSQL when DATABASE_URL is set, so a
+// restarted server goes on with them, and in memory otherwise.
+func openStore(logger *slog.Logger) (store.Store, *routing.Deletes, func(), error) {
+	url := os.Getenv("DATABASE_URL")
+	if url == "" {
+		logger.Warn("DATABASE_URL not set; migrations are lost when the server stops")
+		return store.NewMemory(), routing.NewDeletes(), func() {}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pg, err := store.OpenPostgres(ctx, url)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("DATABASE_URL: %w", err)
+	}
+	deletes, err := routing.LoadDeletes(ctx, pg)
+	if err != nil {
+		pg.Close()
+		return nil, nil, nil, fmt.Errorf("load deleted keys: %w", err)
+	}
+	return pg, deletes, pg.Close, nil
 }
 
 // newEngine picks the engine from ENGINE and returns it with its default

@@ -28,3 +28,12 @@ type Store interface {
 	// ListActive returns migrations that are not in a terminal phase.
 	ListActive(ctx context.Context) ([]migration.Migration, error)
 }
+
+// SavedResponse is the first response to a request with an
+// Idempotency-Key, replayed when the key comes again.
+type SavedResponse struct {
+	Fingerprint [32]byte
+	Status      int
+	Location    string
+	Body        []byte
+}

@@ -137,6 +137,8 @@ func (r *Rclone) follow(ctx context.Context, m migration.Migration, st *stream, 
 		return SyncReport{}, err
 	}
 
+	r.savePosition(work, m.ID, st)
+
 	backlog, err := st.feed.Backlog(ctx)
 	if err != nil {
 		return SyncReport{}, fmt.Errorf("backlog: %w", err)
@@ -567,6 +569,7 @@ func (r *Rclone) drain(ctx context.Context, m migration.Migration, st *stream, s
 			return fmt.Errorf("source changes still waiting after %s", r.Stream.DrainTimeout)
 		}
 	}
+	r.savePosition(ctx, m.ID, st)
 	// No more canaries; remove the one in flight, if any.
 	if err := copier.DeleteAll(ctx, src, canaryPrefix(m.ID)); err != nil {
 		return fmt.Errorf("remove canaries: %w", err)

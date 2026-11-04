@@ -118,19 +118,25 @@ func New(ctx context.Context, opt Options) (*Store, error) {
 }
 
 // Run refreshes the route every Interval until ctx is done. While the
-// migration server cannot be reached, the last route stays in use.
+// migration server cannot be reached, the last route stays in use until the
+// lease runs out, and Run asks every retryInterval, to renew the lease as
+// soon as the server is back.
 func (s *Store) Run(ctx context.Context) {
-	t := time.NewTicker(s.opt.Interval)
-	defer t.Stop()
+	wait := s.opt.Interval
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
-			_ = s.Refresh(ctx)
+		case <-time.After(wait):
+		}
+		wait = s.opt.Interval
+		if err := s.Refresh(ctx); err != nil {
+			wait = min(s.opt.Interval, retryInterval)
 		}
 	}
 }
+
+const retryInterval = 200 * time.Millisecond
 
 // Refresh asks for the route, reporting the generation in use. When the
 // route changed, it asks once more so the server learns at once that the
@@ -292,25 +298,44 @@ func (s *Store) open(r Route) error {
 }
 
 func (s *Store) recordDelete(ctx context.Context, key string) error {
+	// A server that is briefly away, restarting say, is tried again for as
+	// long as the route may be used without it.
+	ctx, cancel := context.WithTimeout(ctx, s.opt.Lease)
+	defer cancel()
+	for wait := 20 * time.Millisecond; ; wait = min(2*wait, 500*time.Millisecond) {
+		retry, err := s.postDelete(ctx, key)
+		if err == nil || !retry {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(wait):
+		}
+	}
+}
+
+// postDelete records key once and tells whether a failure may pass.
+func (s *Store) postDelete(ctx context.Context, key string) (retry bool, err error) {
 	body, err := json.Marshal(map[string][]string{"keys": {key}})
 	if err != nil {
-		return err
+		return false, err
 	}
 	u := fmt.Sprintf("%s/v1/migrations/%s/deletes", s.opt.Server, url.PathEscape(s.opt.Migration))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := s.opt.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("record delete: %w", err)
+		return ctx.Err() == nil, fmt.Errorf("record delete: %w", err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("record delete: %s", resp.Status)
+		return resp.StatusCode >= 500, fmt.Errorf("record delete: %s", resp.Status)
 	}
-	return nil
+	return false, nil
 }
 
 // Route returns the route in use.

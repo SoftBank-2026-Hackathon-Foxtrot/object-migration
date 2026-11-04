@@ -531,7 +531,7 @@ func TestCopiesHonorKeysAppsDeleted(t *testing.T) {
 
 	// A copy that lands after an app's delete is removed again.
 	putObject(t, src, "racing")
-	r.Deletes.Add(m.ID, "racing") // the app recorded it, and is about to delete it
+	_ = r.Deletes.Add(ctx, m.ID, "racing") // the app recorded it, and is about to delete it
 	if act, err := r.syncKey(ctx, m.ID, src, dst, "racing"); err != nil || exists(t, dst, "racing") {
 		t.Fatalf("syncKey: %v, %v; the deleted key must not stay in the target", act, err)
 	}
@@ -544,7 +544,7 @@ func TestCopiesHonorKeysAppsDeleted(t *testing.T) {
 	if !exists(t, dst, "bulk") {
 		t.Fatal("bulk copy")
 	}
-	r.Deletes.Add(m.ID, "bulk")
+	_ = r.Deletes.Add(ctx, m.ID, "bulk")
 	if err := r.Resume(ctx, m); err != nil {
 		t.Fatal(err)
 	}
@@ -554,12 +554,12 @@ func TestCopiesHonorKeysAppsDeleted(t *testing.T) {
 
 	// The reverse copy honors them too.
 	putObject(t, dst, "new-in-target")
-	r.Deletes.Add(m.ID, "new-in-target")
+	_ = r.Deletes.Add(ctx, m.ID, "new-in-target")
 	if _, err := r.copyBack(ctx, m.ID, src, dst); err != nil {
 		t.Fatal(err)
 	}
-	if exists(t, src, "new-in-target") {
-		t.Fatal("reverse copy brought back a key an app deleted")
+	if exists(t, src, "new-in-target") || exists(t, dst, "new-in-target") {
+		t.Fatal("reverse copy kept a key an app deleted")
 	}
 	if err := r.Release(ctx, m); err != nil || r.Deletes.Has(m.ID, "bulk") {
 		t.Fatalf("release: %v, deletes kept: %v", err, r.Deletes.Has(m.ID, "bulk"))
@@ -597,5 +597,113 @@ func TestDrainDoesNotWaitForChangesMadeAfterItStarted(t *testing.T) {
 	}
 	if time.Since(start) > 3*time.Second || !exists(t, dst, "before-resume") {
 		t.Fatalf("resume took %s, before-resume copied: %v", time.Since(start), exists(t, dst, "before-resume"))
+	}
+}
+
+// resumableFeed is a memFeed that reads from a position the server keeps,
+// like the SeaweedFS feed.
+type resumableFeed struct {
+	*memFeed
+	pos, resumedFrom string
+}
+
+func (f *resumableFeed) Position() string { return f.pos }
+
+func (f *resumableFeed) ResumeFrom(pos string) error {
+	f.resumedFrom = pos
+	return nil
+}
+
+// memPositions keeps feed positions as the database does.
+type memPositions struct {
+	mu  sync.Mutex
+	pos map[string]string
+}
+
+func (p *memPositions) FeedPosition(_ context.Context, id string) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pos[id], nil
+}
+
+func (p *memPositions) SaveFeedPosition(_ context.Context, id, pos string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.pos == nil {
+		p.pos = map[string]string{}
+	}
+	p.pos[id] = pos
+	return nil
+}
+
+func (p *memPositions) ForgetFeedPosition(_ context.Context, id string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.pos, id)
+	return nil
+}
+
+func TestRestartResumesTheFeedWhereItWasRead(t *testing.T) {
+	ctx := context.Background()
+	r, feed, m, src, _ := streamEngine(t)
+	positions := &memPositions{}
+	r.Positions = positions
+	first := &resumableFeed{memFeed: feed, pos: "100"}
+	r.feed = func(context.Context, migration.Migration) (Feed, error) { return first, nil }
+	for _, pos := range []string{"100", "200"} {
+		first.pos = pos
+		if _, err := r.Sync(ctx, m); err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := positions.FeedPosition(ctx, m.ID); got != pos {
+			t.Fatalf("saved position = %q, want %q", got, pos)
+		}
+	}
+
+	// A restarted server knows nothing but what was saved.
+	r.streams = map[string]*stream{}
+	second := &resumableFeed{memFeed: &memFeed{src: src}, pos: "200"}
+	r.feed = func(context.Context, migration.Migration) (Feed, error) { return second, nil }
+	if _, err := r.Sync(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if second.resumedFrom != "200" || second.subscribes != 1 {
+		t.Fatalf("resumed from %q after %d subscribes", second.resumedFrom, second.subscribes)
+	}
+	if err := r.Release(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := positions.FeedPosition(ctx, m.ID); got != "" {
+		t.Fatalf("position kept after release: %q", got)
+	}
+}
+
+// oldDeletes holds keys apps deleted long ago.
+type oldDeletes map[string]map[string]time.Time
+
+func (d oldDeletes) RecordDeletes(context.Context, string, []string, time.Time) error { return nil }
+func (d oldDeletes) LoadDeletes(context.Context) (map[string]map[string]time.Time, error) {
+	return d, nil
+}
+func (d oldDeletes) ForgetDeletes(context.Context, string) error { return nil }
+
+func TestRestartRemovesKeysACopyBroughtBack(t *testing.T) {
+	ctx := context.Background()
+	r, _, m, _, dst := streamEngine(t)
+	m.CreatedAt = time.Now().Add(-time.Hour)
+	var err error
+	r.Deletes, err = routing.LoadDeletes(ctx, oldDeletes{m.ID: {"gone": time.Now().Add(-30 * time.Minute)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An app deleted the key half an hour ago, but a copy that read it
+	// from the source just before was cut short by a restart after writing
+	// it to the target. Resume, which compares nothing, runs next.
+	putObject(t, dst, "gone")
+	if err := r.Resume(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	if exists(t, dst, "gone") {
+		t.Fatal("resume after a restart kept a key an app deleted")
 	}
 }
