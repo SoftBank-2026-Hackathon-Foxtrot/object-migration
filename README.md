@@ -27,7 +27,8 @@ Restarts: the server was killed with SIGKILL during the initial copy, while foll
 | SeaweedFS → GCS | filer subscription, resumed from the saved position | PostgreSQL (the earlier store) | 20,122 | 0 | 0 | 0 |
 | GCS → SeaweedFS | Pub/Sub | PostgreSQL (the earlier store) | 8,553 | 0 | 0 | 0 |
 | SeaweedFS → SeaweedFS | filer subscription, resumed from the saved position | PostgreSQL (the earlier store) | 4,179 | 0 | 0 | 0 |
-| SeaweedFS → SeaweedFS | filer subscription, resumed from the saved position | DynamoDB Local | 4,267 | 0 | 0 | 0 |
+| SeaweedFS → SeaweedFS | filer subscription, resumed from the saved position | DynamoDB | 4,491 | 0 | 0 | 0 |
+| S3 → GCS | SQS | DynamoDB | 9,361 | 0 | 0 | 0 |
 
 `scripts/scenario.sh` runs one direction end to end; `/v1/capabilities` lists every direction with its change feed and how objects are compared.
 
