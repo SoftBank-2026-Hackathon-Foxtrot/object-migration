@@ -148,3 +148,34 @@ func TestReturnedCopiesAreIsolated(t *testing.T) {
 		t.Fatal("caller's change leaked into the store")
 	}
 }
+
+func TestRequestCommandSavesAReplacedCommand(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemory()
+	m := create(t, s)
+	m.Phase, m.State = migration.PhaseFrozen, migration.StateWaiting
+	m, err := s.Update(ctx, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RequestCommand(ctx, m.ID, migration.CommandRequest{Command: migration.CommandSwitch, RequestedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	stuck, _ := s.Get(ctx, m.ID)
+	stuck.State = migration.StateUnknown
+	if _, err := s.Update(ctx, stuck); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := s.Get(ctx, m.ID)
+	if _, err := s.RequestCommand(ctx, m.ID, migration.CommandRequest{Command: migration.CommandRollback, RequestedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := s.Get(ctx, m.ID)
+	if after.Pending == nil || after.Pending.Command != migration.CommandRollback || after.Version != before.Version+1 {
+		t.Fatalf("pending %+v version %d -> %d; want the rollback saved with a new version", after.Pending, before.Version, after.Version)
+	}
+	// A stale writer holding the old version can no longer undo it.
+	if _, err := s.Update(ctx, before); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale update: %v, want conflict", err)
+	}
+}

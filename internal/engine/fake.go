@@ -85,6 +85,10 @@ func (f *Fake) Rollback(ctx context.Context, _ migration.Migration) error {
 	return f.wait(ctx, f.Delay)
 }
 func (f *Fake) Abort(ctx context.Context, _ migration.Migration) error { return f.wait(ctx, f.Delay) }
+func (f *Fake) Prepare(ctx context.Context, _ migration.Migration) error {
+	return f.wait(ctx, f.Delay)
+}
+func (f *Fake) Release(context.Context, migration.Migration) error { return nil }
 
 func (f *Fake) wait(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d)

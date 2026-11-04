@@ -8,11 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/engine"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/routing"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 )
 
@@ -25,7 +28,21 @@ type Config struct {
 	// SyncInterval is the wait between incremental sync rounds and between
 	// verification attempts. Zero means PollInterval.
 	SyncInterval time.Duration
+	// Apps tracks which route each app has applied. When set, a step that
+	// changes the route waits until every live app applied it.
+	Apps *routing.Apps
+	// ConfirmTimeout is how long a step waits for apps when the command
+	// gives no deadline. Zero means 30 seconds.
+	ConfirmTimeout time.Duration
 }
+
+// ErrUnconfirmed means some apps did not apply a new route in time. The
+// outcome is unknown until they do; the step keeps waiting for them.
+var ErrUnconfirmed = errors.New("apps have not applied the new route")
+
+// errSuperseded stops a command that another command replaced, before it
+// moves apps any further.
+var errSuperseded = errors.New("command replaced")
 
 type Worker struct {
 	store  store.Store
@@ -46,6 +63,9 @@ type Worker struct {
 func New(s store.Store, e engine.Engine, cfg Config, log *slog.Logger) *Worker {
 	if cfg.SyncInterval == 0 {
 		cfg.SyncInterval = cfg.PollInterval
+	}
+	if cfg.ConfirmTimeout == 0 {
+		cfg.ConfirmTimeout = 30 * time.Second
 	}
 	return &Worker{
 		store:     s,
@@ -92,8 +112,8 @@ func (w *Worker) Notify(id string) {
 	if wake, ok := w.running[id]; ok {
 		if cancel, ok := w.interrupt[id]; ok {
 			cancel()
-			return
 		}
+		// Wake it too: the copy may have just ended without seeing the cancel.
 		select {
 		case wake <- struct{}{}:
 		default:
@@ -181,6 +201,9 @@ func (w *Worker) loop(ctx context.Context, id string, wake <-chan struct{}) {
 		}
 
 		wait, err := w.step(ctx, m)
+		if errors.Is(err, errSuperseded) {
+			continue // run the command that replaced it
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -219,6 +242,9 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 
 	switch m.Phase {
 	case migration.PhaseCreated:
+		if err := w.engine.Prepare(ctx, m); err != nil {
+			return 0, err
+		}
 		return 0, w.mutate(ctx, m.ID, func(x *migration.Migration) error {
 			x.Replication.Forward.State = migration.FlowInitialCopy
 			return w.enter(x, migration.PhaseInitialSync, migration.StateRunning)
@@ -258,6 +284,10 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 			}
 			return 0, err
 		}
+		wait := w.cfg.SyncInterval
+		if report.Wait > 0 {
+			wait = report.Wait
+		}
 		err = w.mutate(ctx, m.ID, func(x *migration.Migration) error {
 			if x.Phase != migration.PhaseSyncing && x.Phase != migration.PhaseReady {
 				return nil // a command moved it on while we synced
@@ -277,7 +307,7 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 			}
 			return nil
 		})
-		return w.cfg.SyncInterval, err
+		return wait, err
 
 	case migration.PhaseResumed:
 		return 0, w.mutate(ctx, m.ID, func(x *migration.Migration) error {
@@ -285,9 +315,9 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 		})
 
 	case migration.PhaseVerifying:
-		if m.State == migration.StateSucceeded {
-			return w.cfg.PollInterval, nil // verified; waiting for finalize or rollback
-		}
+		// Verification goes on after it first passes: each round also copies
+		// the target's new objects back to the source, so a rollback stays
+		// possible until finalize.
 		report, err := w.engine.Verify(ctx, m)
 		if err != nil {
 			return 0, err
@@ -301,6 +331,8 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 			x.Replication.Reverse.LagSeconds = report.ReverseLagSeconds
 			if report.Advance.Result == migration.ResultPass {
 				x.State = migration.StateSucceeded
+			} else {
+				x.State = migration.StateRunning
 			}
 			return nil
 		})
@@ -308,7 +340,25 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 		return w.cfg.SyncInterval, err
 
 	case migration.PhaseRollingBack:
-		if err := w.engine.Rollback(ctx, m); err != nil {
+		// Writes go back to the source while reads still find what was
+		// written to the target; once the engine has copied that back, the
+		// target is dropped.
+		// A retry picks up after the last step that finished: going back to
+		// reading the target once apps stopped deleting from it would find
+		// objects deleted since.
+		deadline := w.now().Add(w.cfg.ConfirmTimeout)
+		if !routeIn(m.Routing, migration.RouteSource, migration.RouteSourceOnly) {
+			if err := w.route(ctx, m.ID, deadline, migration.RouteBoth, nil); err != nil {
+				return 0, err
+			}
+			if err := w.engine.Rollback(ctx, m); err != nil {
+				return 0, err
+			}
+		}
+		if err := w.routeSteps(ctx, m.ID, deadline, nil, migration.RouteSource, migration.RouteSourceOnly); err != nil {
+			return 0, err
+		}
+		if err := w.engine.Release(ctx, m); err != nil {
 			return 0, err
 		}
 		return 0, w.mutate(ctx, m.ID, func(x *migration.Migration) error {
@@ -337,7 +387,15 @@ func (w *Worker) runCommand(ctx context.Context, m migration.Migration) error {
 	case migration.CommandFreeze:
 		act, to, state = w.engine.Freeze, migration.PhaseFrozen, migration.StateWaiting
 	case migration.CommandSwitch:
-		act, to, state = w.engine.Switch, migration.PhaseSwitched, migration.StateWaiting
+		// Reads cover both sides before writes move, so every app finds
+		// objects written by apps on either route.
+		act = func(ctx context.Context, m migration.Migration) error {
+			if err := w.routeSteps(ctx, m.ID, w.deadline(cmd), &cmd, migration.RouteBoth, migration.RouteTarget); err != nil {
+				return err
+			}
+			return w.engine.Switch(ctx, m)
+		}
+		to, state = migration.PhaseSwitched, migration.StateWaiting
 	case migration.CommandResume:
 		act, to, state = w.engine.Resume, migration.PhaseResumed, migration.StateRunning
 		before = func(x *migration.Migration) { x.Replication.Forward.State = migration.FlowDraining }
@@ -350,10 +408,24 @@ func (w *Worker) runCommand(ctx context.Context, m migration.Migration) error {
 			x.Replication.Reverse = migration.Flow{State: reverse}
 		}
 	case migration.CommandFinalize:
-		act, to, state = w.engine.Finalize, migration.PhaseCompleted, migration.StateSucceeded
+		act = func(ctx context.Context, m migration.Migration) error {
+			if err := w.routeSteps(ctx, m.ID, w.deadline(cmd), &cmd, migration.RouteTargetAlone, migration.RouteTargetOnly); err != nil {
+				return err
+			}
+			return w.engine.Finalize(ctx, m)
+		}
+		to, state = migration.PhaseCompleted, migration.StateSucceeded
 		after = stopFlows
 	case migration.CommandAbort:
-		act, to, state = w.engine.Abort, migration.PhaseAborted, migration.StateSucceeded
+		act = func(ctx context.Context, m migration.Migration) error {
+			// Before the switch apps only write to the source; deletes stop
+			// going to the target.
+			if err := w.route(ctx, m.ID, w.deadline(cmd), migration.RouteSourceOnly, &cmd); err != nil {
+				return err
+			}
+			return w.engine.Abort(ctx, m)
+		}
+		to, state = migration.PhaseAborted, migration.StateSucceeded
 		after = stopFlows
 	case migration.CommandRollback:
 		// The engine work runs in ROLLING_BACK so a crash resumes it.
@@ -375,6 +447,14 @@ func (w *Worker) runCommand(ctx context.Context, m migration.Migration) error {
 	}
 	if act != nil {
 		if err := act(ctx, m); err != nil {
+			return err
+		}
+	}
+	if to.Terminal() {
+		if err := w.stillPending(ctx, m.ID, cmd); err != nil {
+			return err
+		}
+		if err := w.engine.Release(ctx, m); err != nil {
 			return err
 		}
 	}
@@ -405,6 +485,95 @@ func sameRequest(p *migration.CommandRequest, c migration.CommandRequest) bool {
 	return p != nil && p.Command == c.Command && p.IdempotencyKey == c.IdempotencyKey && p.RequestedAt.Equal(c.RequestedAt)
 }
 
+// deadline is when a command's wait for apps gives up.
+func (w *Worker) deadline(cmd migration.CommandRequest) time.Time {
+	if cmd.DeadlineMS > 0 {
+		return w.now().Add(time.Duration(cmd.DeadlineMS) * time.Millisecond)
+	}
+	return w.now().Add(w.cfg.ConfirmTimeout)
+}
+
+// routeSteps moves the migration through steps in order, starting after
+// the last step it is on already, so a retried command never moves apps
+// back.
+func (w *Worker) routeSteps(ctx context.Context, id string, deadline time.Time, cmd *migration.CommandRequest, steps ...migration.Route) error {
+	m, err := w.store.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	from := 0
+	for i, r := range steps {
+		if routeIn(m.Routing, r) {
+			from = i // re-confirm the step it is on, then go on
+		}
+	}
+	for _, r := range steps[from:] {
+		if err := w.route(ctx, id, deadline, r, cmd); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// routeIn reports whether cur is one of the routes, ignoring generations.
+func routeIn(cur migration.Route, routes ...migration.Route) bool {
+	for _, r := range routes {
+		if cur.Write == r.Write && slices.Equal(cur.Read, r.Read) && slices.Equal(cur.Delete, r.Delete) {
+			return true
+		}
+	}
+	return false
+}
+
+// route moves the migration to r and waits until every live app applied
+// it. With cmd set, it stops with errSuperseded as soon as cmd is no
+// longer the pending command, before or while it waits.
+func (w *Worker) route(ctx context.Context, id string, deadline time.Time, r migration.Route, cmd *migration.CommandRequest) error {
+	var gen int64
+	if err := w.mutate(ctx, id, func(x *migration.Migration) error {
+		if cmd != nil && !sameRequest(x.Pending, *cmd) {
+			return errSuperseded
+		}
+		gen = x.SetRoute(r)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if w.cfg.Apps == nil {
+		return nil
+	}
+	t := time.NewTicker(20 * time.Millisecond)
+	defer t.Stop()
+	for n := 0; len(w.cfg.Apps.Waiting(id, gen)) > 0; n++ {
+		if !w.now().Before(deadline) {
+			return fmt.Errorf("%w: generation %d, waiting for %s", ErrUnconfirmed, gen, strings.Join(w.cfg.Apps.Waiting(id, gen), ", "))
+		}
+		if cmd != nil && n%5 == 4 {
+			if err := w.stillPending(ctx, id, *cmd); err != nil {
+				return err
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+	return nil
+}
+
+// stillPending returns errSuperseded once cmd is no longer pending.
+func (w *Worker) stillPending(ctx context.Context, id string, cmd migration.CommandRequest) error {
+	m, err := w.store.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !sameRequest(m.Pending, cmd) {
+		return errSuperseded
+	}
+	return nil
+}
+
 func (w *Worker) enter(x *migration.Migration, to migration.Phase, state migration.State) error {
 	if err := x.TransitionTo(to, w.now()); err != nil {
 		return err
@@ -414,7 +583,29 @@ func (w *Worker) enter(x *migration.Migration, to migration.Phase, state migrati
 }
 
 func (w *Worker) recordError(ctx context.Context, id string, cause error, permanent bool) error {
+	if permanent {
+		// A failed migration must not leave subscriptions behind, but
+		// failing to remove them must not hide the cause.
+		if m, err := w.store.Get(ctx, id); err == nil {
+			for attempt := range 3 {
+				err := w.engine.Release(ctx, m)
+				if err == nil {
+					break
+				}
+				w.log.Error("release after failure", "migration", id, "attempt", attempt+1, "err", err)
+				select {
+				case <-ctx.Done():
+				case <-time.After(w.cfg.RetryBackoff):
+				}
+			}
+		}
+	}
 	return w.mutate(ctx, id, func(x *migration.Migration) error {
+		if errors.Is(cause, ErrUnconfirmed) {
+			x.LastError = &migration.Error{Code: "APPS_NOT_CONFIRMED", Message: cause.Error(), Retryable: true}
+			x.State = migration.StateUnknown
+			return nil
+		}
 		x.LastError = &migration.Error{Code: "ENGINE_ERROR", Message: cause.Error(), Retryable: !permanent}
 		if permanent {
 			return w.enter(x, migration.PhaseFailed, migration.StateFailed)

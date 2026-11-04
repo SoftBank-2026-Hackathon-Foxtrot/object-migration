@@ -32,6 +32,7 @@ func TestNewValidatesEndpoints(t *testing.T) {
 		{"missing ref", Endpoint{Kind: KindS3, Region: "ap-northeast-1", Bucket: "b"}, dst},
 		{"missing s3 region", Endpoint{Kind: KindS3, Bucket: "b", Ref: "r"}, dst},
 		{"seaweedfs without url", src, Endpoint{Kind: KindSeaweedFS, Bucket: "b", Ref: "r"}},
+		{"filer on gcs", src, Endpoint{Kind: KindGCS, Bucket: "b", Ref: "r", Filer: "host:18888"}},
 		{"same bucket", src, src},
 	}
 	for _, tt := range tests {
@@ -258,5 +259,60 @@ func TestExpectedVersion(t *testing.T) {
 	m.Version = 8
 	if err := m.RequestCommand(CommandRequest{Command: CommandFreeze, ExpectedVersion: 7, IdempotencyKey: "k"}); err != nil {
 		t.Fatalf("repeat: %v", err)
+	}
+}
+
+func TestSetRouteBumpsGenerationOnlyOnChange(t *testing.T) {
+	m := newMigration(t)
+	if m.Routing.Generation != 1 || m.Routing.Write != SideSource {
+		t.Fatalf("initial route %+v", m.Routing)
+	}
+	if g := m.SetRoute(RouteSource); g != 1 {
+		t.Fatalf("same route: generation %d", g)
+	}
+	if g := m.SetRoute(RouteBoth); g != 2 {
+		t.Fatalf("both: generation %d", g)
+	}
+	if g := m.SetRoute(RouteBoth); g != 2 {
+		t.Fatalf("both again: generation %d", g)
+	}
+	if g := m.SetRoute(RouteTarget); g != 3 || m.Routing.Write != SideTarget || m.Routing.Read[1] != SideSource {
+		t.Fatalf("target: %d %+v", g, m.Routing)
+	}
+	c := m.Clone()
+	c.Routing.Read[0] = SideSource
+	if m.Routing.Read[0] != SideTarget {
+		t.Fatal("Clone shares the read list")
+	}
+}
+
+func TestRollbackReplacesASwitchStuckOnApps(t *testing.T) {
+	m := newMigration(t)
+	m.Phase = PhaseFrozen
+	if err := m.RequestCommand(CommandRequest{Command: CommandSwitch}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RequestCommand(CommandRequest{Command: CommandRollback}); !errors.Is(err, ErrCommandPending) {
+		t.Fatalf("rollback over a running switch: %v, want pending", err)
+	}
+	m.State = StateUnknown // apps did not confirm
+	if err := m.RequestCommand(CommandRequest{Command: CommandAbort}); !errors.Is(err, ErrCommandPending) {
+		t.Fatalf("abort over a stuck switch: %v, want pending", err)
+	}
+	if err := m.RequestCommand(CommandRequest{Command: CommandRollback}); err != nil || m.Pending.Command != CommandRollback {
+		t.Fatalf("rollback over a stuck switch: %v, pending %+v", err, m.Pending)
+	}
+}
+
+func TestRollbackDoesNotReplaceAStuckFinalize(t *testing.T) {
+	m := newMigration(t)
+	m.Phase = PhaseVerifying
+	m.Readiness.Advance = Decide(Check{Name: "ok", OK: true})
+	if err := m.RequestCommand(CommandRequest{Command: CommandFinalize}); err != nil {
+		t.Fatal(err)
+	}
+	m.State = StateUnknown
+	if err := m.RequestCommand(CommandRequest{Command: CommandRollback}); !errors.Is(err, ErrCommandPending) {
+		t.Fatalf("rollback over a stuck finalize: %v, want pending", err)
 	}
 }

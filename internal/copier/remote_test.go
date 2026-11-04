@@ -4,6 +4,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/creds"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
 )
 
@@ -34,8 +35,8 @@ func TestBackendConfigS3FromEnv(t *testing.T) {
 
 func TestBackendConfigDefaultRef(t *testing.T) {
 	for _, e := range []migration.Endpoint{
-		{Kind: migration.KindS3, Bucket: "b", Region: "ap-northeast-1", Ref: RefDefault},
-		{Kind: migration.KindGCS, Bucket: "b", Ref: RefDefault},
+		{Kind: migration.KindS3, Bucket: "b", Region: "ap-northeast-1", Ref: creds.Default},
+		{Kind: migration.KindGCS, Bucket: "b", Ref: creds.Default},
 	} {
 		_, conf, err := backendConfig(e)
 		if err != nil || conf["env_auth"] != "true" {
@@ -51,7 +52,7 @@ func TestBackendConfigGCSAndSeaweedFS(t *testing.T) {
 		t.Fatalf("gcs: %q %v %v", backend, conf, err)
 	}
 
-	backend, conf, err = backendConfig(migration.Endpoint{Kind: migration.KindSeaweedFS, Bucket: "b", URL: "http://10.0.0.5:8333", Ref: RefDefault})
+	backend, conf, err = backendConfig(migration.Endpoint{Kind: migration.KindSeaweedFS, Bucket: "b", URL: "http://10.0.0.5:8333", Ref: creds.Default})
 	if err != nil || backend != "s3" || conf["provider"] != "SeaweedFS" || conf["endpoint"] != "http://10.0.0.5:8333" || conf["force_path_style"] != "true" {
 		t.Fatalf("seaweedfs: %q %v %v", backend, conf, err)
 	}
@@ -65,8 +66,8 @@ func TestBackendConfigBadRefs(t *testing.T) {
 		{Kind: migration.KindS3, Bucket: "b", Region: "r", Ref: "env:lower"},
 	}
 	for _, e := range tests {
-		if _, _, err := backendConfig(e); !errors.Is(err, ErrBadRef) {
-			t.Errorf("%s %q: err = %v, want ErrBadRef", e.Kind, e.Ref, err)
+		if _, _, err := backendConfig(e); !errors.Is(err, creds.ErrBadRef) {
+			t.Errorf("%s %q: err = %v, want creds.ErrBadRef", e.Kind, e.Ref, err)
 		}
 	}
 }

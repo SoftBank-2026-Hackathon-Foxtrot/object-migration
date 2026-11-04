@@ -1,0 +1,14 @@
+{
+  "identities": [
+    {
+      "name": "object-migration",
+      "credentials": [{ "accessKey": "REPLACE_ME", "secretKey": "REPLACE_ME" }],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    },
+    {
+      "name": "app",
+      "credentials": [{ "accessKey": "REPLACE_ME", "secretKey": "REPLACE_ME" }],
+      "actions": ["Read", "Write", "List"]
+    }
+  ]
+}

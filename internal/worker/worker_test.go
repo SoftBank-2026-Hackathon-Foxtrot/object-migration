@@ -3,8 +3,11 @@ package worker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -374,12 +377,75 @@ func TestRollbackResumesAfterRestart(t *testing.T) {
 	s := store.NewMemory()
 	w1, stop1 := start(t, s, blockingRollback{engine.NewFake(time.Millisecond)})
 	m := toFrozen(t, w1, s)
+	command(t, w1, s, m.ID, migration.CommandSwitch)
+	waitPhase(t, s, m.ID, migration.PhaseSwitched)
 	command(t, w1, s, m.ID, migration.CommandRollback)
 	waitPhase(t, s, m.ID, migration.PhaseRollingBack)
 	stop1()
 
 	start(t, s, engine.NewFake(time.Millisecond))
-	waitPhase(t, s, m.ID, migration.PhaseRolledBack)
+	done := waitPhase(t, s, m.ID, migration.PhaseRolledBack)
+	if !routeIn(done.Routing, migration.RouteSourceOnly) {
+		t.Fatalf("route = %+v", done.Routing)
+	}
+}
+
+// countingRollback is a Fake that counts Rollback calls.
+type countingRollback struct {
+	*engine.Fake
+	n atomic.Int32
+}
+
+func (c *countingRollback) Rollback(context.Context, migration.Migration) error {
+	c.n.Add(1)
+	return nil
+}
+
+func TestRollbackBeforeSwitchCopiesNothingBack(t *testing.T) {
+	s := store.NewMemory()
+	e := &countingRollback{Fake: engine.NewFake(time.Millisecond)}
+	w, _ := start(t, s, e)
+	m := toFrozen(t, w, s)
+	command(t, w, s, m.ID, migration.CommandRollback)
+	done := waitPhase(t, s, m.ID, migration.PhaseRolledBack)
+	if e.n.Load() != 0 {
+		t.Fatal("rolled back the target although apps never wrote to it")
+	}
+	if !routeIn(done.Routing, migration.RouteSourceOnly) {
+		t.Fatalf("route = %+v", done.Routing)
+	}
+}
+
+// failingRelease is a Fake whose Release fails a few times.
+type failingRelease struct {
+	*engine.Fake
+	left  atomic.Int32
+	calls atomic.Int32
+}
+
+func (f *failingRelease) Release(context.Context, migration.Migration) error {
+	f.calls.Add(1)
+	if f.left.Add(-1) >= 0 {
+		return errors.New("aws is down")
+	}
+	return nil
+}
+
+func TestRetriedRollbackNeverMovesAppsBack(t *testing.T) {
+	s := store.NewMemory()
+	e := &failingRelease{Fake: engine.NewFake(time.Millisecond)}
+	e.left.Store(2)
+	w, _ := start(t, s, e)
+	m := toFrozen(t, w, s)
+	command(t, w, s, m.ID, migration.CommandSwitch)
+	waitPhase(t, s, m.ID, migration.PhaseSwitched)
+	command(t, w, s, m.ID, migration.CommandRollback)
+	done := waitPhase(t, s, m.ID, migration.PhaseRolledBack)
+	// Switch: 2, 3. Rollback: 4 (both), 5 (source), 6 (source only), and no
+	// more: the retries after Release failed did not go back to reading both.
+	if done.Routing.Generation != 6 || e.calls.Load() != 3 {
+		t.Fatalf("generation %d after %d releases, want 6 after 3", done.Routing.Generation, e.calls.Load())
+	}
 }
 
 // conflicting makes the first n Update calls fail with ErrConflict, as if
@@ -573,4 +639,126 @@ func TestReverseStaysOffWithoutReverseSync(t *testing.T) {
 	if done := waitPhase(t, s, m.ID, migration.PhaseCompleted); done.Replication.Reverse.State != migration.FlowOff {
 		t.Fatalf("reverse after finalize = %s, want OFF", done.Replication.Reverse.State)
 	}
+}
+
+// lifecycle is a Fake that records Prepare and Release, and can fail the
+// initial sync for good.
+type lifecycle struct {
+	*engine.Fake
+	mu            sync.Mutex
+	calls         []string
+	failPermanent bool
+	syncWait      time.Duration
+	syncs         atomic.Int32
+}
+
+func (l *lifecycle) record(s string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = append(l.calls, s)
+}
+
+func (l *lifecycle) Calls() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.calls)
+}
+
+func (l *lifecycle) Prepare(ctx context.Context, m migration.Migration) error {
+	l.record("prepare")
+	return l.Fake.Prepare(ctx, m)
+}
+
+func (l *lifecycle) InitialSync(ctx context.Context, m migration.Migration, report func(migration.Progress)) error {
+	l.record("initial")
+	if l.failPermanent {
+		return fmt.Errorf("%w: bucket gone", engine.ErrPermanent)
+	}
+	return l.Fake.InitialSync(ctx, m, report)
+}
+
+func (l *lifecycle) Sync(ctx context.Context, m migration.Migration) (engine.SyncReport, error) {
+	l.syncs.Add(1)
+	rep, err := l.Fake.Sync(ctx, m)
+	rep.Wait = l.syncWait
+	return rep, err
+}
+
+func (l *lifecycle) Release(context.Context, migration.Migration) error {
+	l.record("release")
+	return nil
+}
+
+func TestPrepareRunsBeforeTheCopyAndReleaseAtTheEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func(t *testing.T, w *Worker, s store.Store, id string)
+		want migration.Phase
+	}{
+		{"finalize", func(t *testing.T, w *Worker, s store.Store, id string) {
+			command(t, w, s, id, migration.CommandFreeze)
+			waitPhase(t, s, id, migration.PhaseFrozen)
+			command(t, w, s, id, migration.CommandSwitch)
+			waitPhase(t, s, id, migration.PhaseSwitched)
+			command(t, w, s, id, migration.CommandResume)
+			waitFor(t, s, id, "verified", func(m migration.Migration) bool { return m.State == migration.StateSucceeded })
+			command(t, w, s, id, migration.CommandFinalize)
+		}, migration.PhaseCompleted},
+		{"abort", func(t *testing.T, w *Worker, s store.Store, id string) {
+			command(t, w, s, id, migration.CommandAbort)
+		}, migration.PhaseAborted},
+		{"rollback", func(t *testing.T, w *Worker, s store.Store, id string) {
+			command(t, w, s, id, migration.CommandFreeze)
+			waitPhase(t, s, id, migration.PhaseFrozen)
+			command(t, w, s, id, migration.CommandRollback)
+		}, migration.PhaseRolledBack},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := store.NewMemory()
+			e := &lifecycle{Fake: engine.NewFake(time.Millisecond)}
+			w, _ := start(t, s, e)
+			m := create(t, s)
+			w.Notify(m.ID)
+			waitPhase(t, s, m.ID, migration.PhaseReady)
+			tc.end(t, w, s, m.ID)
+			waitPhase(t, s, m.ID, tc.want)
+
+			calls := e.Calls()
+			if len(calls) < 3 || calls[0] != "prepare" || calls[1] != "initial" || calls[len(calls)-1] != "release" {
+				t.Fatalf("calls = %v", calls)
+			}
+			if n := slices.Index(calls, "release"); n != len(calls)-1 {
+				t.Fatalf("release ran before the end: %v", calls)
+			}
+		})
+	}
+}
+
+func TestReleaseAfterPermanentFailure(t *testing.T) {
+	s := store.NewMemory()
+	e := &lifecycle{Fake: engine.NewFake(time.Millisecond), failPermanent: true}
+	w, _ := start(t, s, e)
+	m := create(t, s)
+	w.Notify(m.ID)
+	waitPhase(t, s, m.ID, migration.PhaseFailed)
+	if calls := e.Calls(); !slices.Equal(calls, []string{"prepare", "initial", "release"}) {
+		t.Fatalf("calls = %v", calls)
+	}
+}
+
+func TestEngineCanAskForTheNextRoundSooner(t *testing.T) {
+	s := store.NewMemory()
+	e := &lifecycle{Fake: engine.NewFake(time.Millisecond), syncWait: time.Millisecond}
+	e.SyncRounds = 1000 // never ready, keep syncing
+	cfg := testCfg
+	cfg.SyncInterval = time.Hour
+	w := New(s, e, cfg, quietLog())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = w.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	m := create(t, s)
+	w.Notify(m.ID)
+	waitFor(t, s, m.ID, "several rounds", func(migration.Migration) bool { return e.syncs.Load() >= 5 })
 }

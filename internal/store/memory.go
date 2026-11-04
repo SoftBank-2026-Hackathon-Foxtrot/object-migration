@@ -52,8 +52,9 @@ func (s *Memory) RequestCommand(_ context.Context, id string, req migration.Comm
 	if err := m.RequestCommand(req); err != nil {
 		return migration.Migration{}, err
 	}
-	// A repeated request leaves the pending command as it was; no write.
-	if before == nil {
+	// A repeated request leaves the pending command as it was; no write. A
+	// new one, or one that replaced a stuck command, is saved.
+	if before == nil || !samePending(*before, *m.Pending) {
 		m.Version++
 		s.byID[id] = m.Clone()
 	}
@@ -86,4 +87,8 @@ func (s *Memory) ListActive(_ context.Context) ([]migration.Migration, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
 	return out, nil
+}
+
+func samePending(a, b migration.CommandRequest) bool {
+	return a.Command == b.Command && a.IdempotencyKey == b.IdempotencyKey && a.RequestedAt.Equal(b.RequestedAt)
 }

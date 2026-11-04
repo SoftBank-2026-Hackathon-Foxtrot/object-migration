@@ -15,6 +15,7 @@ import (
 	"github.com/rclone/rclone/fs/operations"
 
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/copier"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/creds"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
 )
 
@@ -28,6 +29,9 @@ func memEngine(t *testing.T) (*Rclone, migration.Migration, fs.Fs, fs.Fs) {
 	r.open = func(ctx context.Context, _ string, e migration.Endpoint) (fs.Fs, error) {
 		return fs.NewFs(ctx, ":memory:"+prefix+"-"+e.Bucket)
 	}
+	// Tests never reach AWS.
+	r.feed = func(context.Context, migration.Migration) (Feed, error) { return nil, nil }
+	r.checkFeed = nil
 	m, err := migration.New(
 		migration.Endpoint{Kind: migration.KindS3, Bucket: "src", Region: "ap-northeast-1", Ref: "default"},
 		migration.Endpoint{Kind: migration.KindGCS, Bucket: "dst", Ref: "default"},
@@ -113,22 +117,71 @@ func TestRcloneSyncIsReadyOnlyWhenCaughtUp(t *testing.T) {
 	}
 }
 
-func TestRcloneVerifyFailsWhenTargetDiffers(t *testing.T) {
+func TestRcloneVerifySettlesBothSides(t *testing.T) {
+	ctx := context.Background()
+	r, m, src, dst := memEngine(t)
+	putObject(t, src, "a")
+	putObject(t, src, "b")
+	if err := r.InitialSync(ctx, m, func(migration.Progress) {}); err != nil {
+		t.Fatal(err)
+	}
+	if err := copier.Delete(ctx, dst, "a"); err != nil {
+		t.Fatal(err)
+	}
+	putObject(t, dst, "written-after-switch")
+	v, err := r.Verify(ctx, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A source object missing from the target, that no app deleted, was
+	// written late; verify copies it.
+	if v.Advance.Result != migration.ResultPass || !exists(t, dst, "a") {
+		t.Fatalf("late source object not copied: %+v", v.Advance)
+	}
+	// The reverse copy brought the app's new object back to the source.
+	if _, err := src.NewObject(ctx, "written-after-switch"); err != nil {
+		t.Fatalf("reverse copy: %v", err)
+	}
+	if v.Rollback.Result != migration.ResultPass {
+		t.Fatalf("rollback readiness: %+v", v.Rollback)
+	}
+}
+
+func TestRcloneRollbackCopiesTheTargetBack(t *testing.T) {
 	ctx := context.Background()
 	r, m, src, dst := memEngine(t)
 	putObject(t, src, "a")
 	if err := r.InitialSync(ctx, m, func(migration.Progress) {}); err != nil {
 		t.Fatal(err)
 	}
-	if err := operations.Purge(ctx, dst, ""); err != nil {
+	putObject(t, dst, "new-in-target")
+	if err := r.Rollback(ctx, m); err != nil {
 		t.Fatal(err)
 	}
-	v, err := r.Verify(ctx, m)
-	if err != nil {
+	if _, err := src.NewObject(ctx, "new-in-target"); err != nil {
+		t.Fatalf("rollback left the target's object behind: %v", err)
+	}
+}
+
+func TestRcloneResumeDrainsTheFeed(t *testing.T) {
+	ctx := context.Background()
+	r, feed, m, src, dst := streamEngine(t)
+	if err := r.InitialSync(ctx, m, func(migration.Progress) {}); err != nil {
 		t.Fatal(err)
 	}
-	if v.Advance.Result != migration.ResultFail {
-		t.Fatalf("verify passed with an empty target: %+v", v.Advance)
+	putObject(t, src, "late")
+	feed.emit("late", false)
+	putObject(t, src, "lost") // its event is lost; the final copy catches it
+	if err := r.Resume(ctx, m); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"late", "lost"} {
+		if !exists(t, dst, k) {
+			t.Fatalf("%s not in the target after resume", k)
+		}
+	}
+	if feed.acked == 0 {
+		t.Fatal("feed not drained")
 	}
 }
 
@@ -137,10 +190,12 @@ func TestRclonePreflight(t *testing.T) {
 	putObject(t, src, "a")
 	// The in-memory target bucket only exists once something is in it.
 	dst, _ := r.open(context.Background(), "", m.Target)
-	putObject(t, dst, "existing")
+	if _, err := copier.SyncKey(context.Background(), src, dst, "a"); err != nil { // a copy, so the target is clean
+		t.Fatal(err)
+	}
 
 	checks := r.Preflight(context.Background(), m.Source, m.Target)
-	want := []string{"source_read", "target_read", "target_write"}
+	want := []string{"source_read", "target_read", "target_write", "target_clean"}
 	if len(checks) != len(want) {
 		t.Fatalf("checks: %+v", checks)
 	}
@@ -171,7 +226,7 @@ func TestRcloneBadRefIsPermanent(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = r.Sync(context.Background(), m)
-	if !errors.Is(err, ErrPermanent) || !errors.Is(err, copier.ErrBadRef) {
+	if !errors.Is(err, ErrPermanent) || !errors.Is(err, creds.ErrBadRef) {
 		t.Fatalf("err = %v, want a permanent bad ref error", err)
 	}
 }

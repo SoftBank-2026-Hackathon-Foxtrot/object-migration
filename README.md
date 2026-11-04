@@ -8,13 +8,37 @@ Design: [architecture](https://softbank-2026-hackathon-foxtrot.github.io/design-
 
 ## Status
 
-M2: the rclone engine copies objects between real buckets. Tested S3 (`ap-northeast-1`) to GCS (`asia-northeast1`) with 1,000 objects.
+Apps switch between AWS S3, GCS and on-prem SeaweedFS, or back, without a failed request. Each direction below was run on real buckets with 3 simulated app servers writing, reading each other's objects and deleting through the [app storage module](docs/app-storage.md) during freeze, switch, resume and finalize; every object written was in the bucket kept, every object deleted in neither.
 
-- `INITIAL_SYNC` copies the whole source. Copying again skips objects that are already identical, so a copy that was stopped or crashed continues where it left off.
-- `SYNCING` copies what is new every `SYNC_INTERVAL`. The migration is `READY` once a round copies nothing and every source object is identical in the target (size and MD5).
-- Deletes in the source are not copied yet. Event-driven copying comes in M3.
-- `freeze`, `switch` and `resume` only move the phase. The app keeps using the source until switching lands in M4, so nothing is copied back after resume and `replication.reverse` stays `OFF`.
-- An `abort` during a copy stops it at once.
+| Direction | Change feed | Requests | Failed |
+| --- | --- | --- | --- |
+| S3 → GCS | SQS | 4,816 | 0 |
+| S3 → GCS, rolled back | SQS | 1,405 | 0 |
+| S3 → SeaweedFS | SQS | 3,110 | 0 |
+| SeaweedFS → S3 | filer subscription | 2,444 | 0 |
+| SeaweedFS → GCS | filer subscription | 2,393 | 0 |
+| GCS → S3 | Pub/Sub | 1,980 | 0 |
+| GCS → SeaweedFS | Pub/Sub | 3,426 | 0 |
+
+`scripts/scenario.sh` runs one direction end to end; `/v1/capabilities` lists every direction with its change feed and how objects are compared.
+
+How a migration runs:
+
+1. **Prepare.** The target must be empty, or hold only identical copies of source objects (`target_clean`). The server creates an SQS queue and adds a notification for every object created or removed in the source bucket, keeping the bucket's other notifications.
+2. **`INITIAL_SYNC`** copies the whole source while changes wait in the queue. A copy that was stopped continues where it left off.
+3. **`SYNCING` / `READY`.** Each changed key is made to match the source as its event arrives: copied if the source has it, deleted from the target if not. The whole source is copied again every `FULL_COPY_INTERVAL` and compared every minute; objects deleted from the source while their events were lost are deleted from the target too. A canary object written to the source under `.object-migration/` every 15 seconds proves events still arrive. `READY` needs the last canary within 10 s, at most 100 changes waiting, p95 lag at most 5 s, and a full comparison that finds nothing missing (except objects written in the last 30 s), different, or only in the target.
+4. **`freeze`** has nothing to do: keys are never rewritten, so writes need not stop.
+5. **`switch`** moves apps in two steps, each waiting until every live app applied it: first reads cover both buckets, then writes move to the target. An app that does not confirm in time leaves the migration `unknown` with `APPS_NOT_CONFIRMED`, and the switch keeps waiting.
+6. **`resume`** handles the source changes still in the queue and copies the source once more.
+7. **`VERIFYING`** checks every source object is in the target, and copies what apps write to the target back to the source, so a rollback loses nothing.
+8. **`finalize`** stops reads from the source, then stops deletes to it. **`rollback`** moves writes back to the source while reads still cover both, copies the target's new objects back, then stops reading and deleting the target.
+9. The queue, the notification and any canary are removed however the migration ends.
+
+Apps record each key they delete with the server before deleting it from the buckets; every copy the server makes, in either direction, removes its copy of a recorded key. A copy and a delete can then finish in either order. Apps report a route as applied only once no request on an older one is running, and stop serving when they cannot refresh the route for 5 seconds during a migration, so the server never moves on while an app may still write where the old route said.
+
+A switch or finalize that waits for an app that never confirms leaves the migration `unknown`; `rollback` may then replace it.
+
+Change feeds: an S3 source through SQS, a GCS source through Pub/Sub (set `GCP_PROJECT` to the platform's project, which holds the topic; the bucket's storage service agent needs `roles/pubsub.publisher` there, which the server grants on the topic when it may), a SeaweedFS source through its filer's metadata subscription (give the endpoint `filer`, the filer's gRPC address). The SeaweedFS feed needs nothing set up on the SeaweedFS side and resumes from the oldest change not yet handled after a lost connection. Sources without a feed (gcs when `GCP_PROJECT` is unset, seaweedfs without `filer`) are mirrored in full every `SYNC_INTERVAL` before the switch. S3 sends each object event to one destination, so a source bucket that already sends object events elsewhere (a Lambda, SNS topic or queue) cannot be followed; preflight reports it as `source_events`.
 
 The status response shows, per migration:
 
@@ -22,7 +46,18 @@ The status response shows, per migration:
 - `replication.forward` and `replication.reverse`: whether each direction is in the initial copy, following changes (CDC), draining, stopped, or off
 - `replication.initialCopy`: objects and bytes copied out of the total
 - `readiness.cutover`, `readiness.advance`, `readiness.rollback`: PASS, FAIL, or UNKNOWN for freezing, finalizing, and going back, with the checks behind each
+- `routing`: the route apps use now: its generation, where they write, read and delete
 - `allowedActions`: the commands accepted right now
+
+## On-prem storage
+
+On-prem buckets live in SeaweedFS, run from [deploy/seaweedfs](deploy/seaweedfs/compose.yaml) on the on-prem VM: one node with master, volume, filer and the S3 gateway. The migration server reaches the S3 API on 8333 and the filer's gRPC on 18888 over Tailscale. Keys go in `s3.json` next to it (see `s3.json.example`): one identity for this server and one for the app.
+
+```json
+{"kind": "seaweedfs", "bucket": "photos", "url": "http://100.64.0.7:8333", "filer": "100.64.0.7:18888", "ref": "env:SEAWEED"}
+```
+
+Tested both ways against SeaweedFS 4.48: AWS S3 to SeaweedFS and SeaweedFS to AWS S3, each through switch and finalize with 3 simulated apps and no failed request. `go test ./internal/copier ./internal/eventsource` also runs S3 compatibility and feed tests against a SeaweedFS when `OM_SEAWEEDFS_URL`, `OM_SEAWEEDFS_FILER`, `OM_SEAWEEDFS_SRC` and `OM_SEAWEEDFS_DST` are set.
 
 ## Credentials
 
@@ -34,6 +69,10 @@ Each endpoint's `ref` says where the server finds its credentials. Requests neve
 | `env:NAME` | `NAME_ACCESS_KEY_ID`, `NAME_SECRET_ACCESS_KEY`, optional `NAME_SESSION_TOKEN` | `NAME_CREDENTIALS_FILE`, a service account key file |
 
 s3 endpoints also need `region`.
+
+The SQS queue is created with the server's own AWS credentials (the default chain), in the source bucket's region; it may be in another account than the bucket. The source `ref` needs `s3:GetBucketNotification` and `s3:PutBucketNotification` on the bucket and `sts:GetCallerIdentity`; the server needs `sqs:CreateQueue`, `sqs:SetQueueAttributes`, `sqs:GetQueueAttributes`, `sqs:GetQueueUrl`, `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:DeleteQueue` and `sqs:TagQueue`.
+
+Set `AWS_PROFILE` when you run the server on a laptop: with `ref: default`, the default profile is what the server uses.
 
 ## Run
 
@@ -54,9 +93,14 @@ ENGINE=fake FAKE_STEP_DELAY=500ms go run ./cmd/object-migration
 | `ADDR` | `:8080` | Listen address |
 | `ENGINE` | `rclone` | `rclone` copies real objects; `fake` only pretends |
 | `POLL_INTERVAL` | `2s` | How often a waiting migration rechecks, and the retry backoff |
-| `SYNC_INTERVAL` | `30s` (`2s` with fake) | Wait between sync rounds. Each rclone round lists both buckets |
+| `SYNC_INTERVAL` | `30s` (`2s` with fake) | Wait between sync rounds for sources without a change feed. Each such round lists both buckets |
+| `GCP_PROJECT` | | Platform project for the Pub/Sub topics that follow GCS sources. Unset: GCS sources are mirrored every round |
+| `FULL_COPY_INTERVAL` | `5m` | How often a source with a change feed is copied in full again, in case an event was lost |
 | `COPY_TRANSFERS` | `16` | Objects copied at once |
 | `COPY_CHECKERS` | `16` | Objects compared at once |
+| `APP_TTL` | `10s` | An app that has not asked for its route for this long is not waited for |
+| `CONFIRM_TIMEOUT` | `30s` | How long a route step waits for apps when the command gives no `deadlineMs` |
+| `LOG_LEVEL` | `info` | `debug` logs every change handled |
 | `FAKE_STEP_DELAY` | `2s` | How long each fake engine step takes |
 
 Drive a migration with curl:
@@ -72,7 +116,13 @@ curl -s -X POST localhost:8080/v1/migrations/$ID/resume       # wait for VERIFYI
 curl -s -X POST localhost:8080/v1/migrations/$ID/finalize
 ```
 
-The API is described in [api/openapi.yaml](api/openapi.yaml).
+Simulate app servers during a migration with `appsim`: it writes, reads each other's objects and deletes through the app storage module, counts every failed request, and writes the keys it left and deleted to compare with the buckets.
+
+```sh
+AWS_PROFILE=foxtrot go run ./cmd/appsim -migration $ID -apps 3 -for 5m
+```
+
+The API is described in [api/openapi.yaml](api/openapi.yaml); what an app's storage module does is in [docs/app-storage.md](docs/app-storage.md).
 
 ## Test
 
@@ -89,8 +139,14 @@ go test -race ./...
 | `internal/api` | HTTP handlers, error mapping, Idempotency-Key replay |
 | `internal/worker` | Runs each migration through its phases, one goroutine per migration |
 | `internal/engine` | Storage work behind each phase: `Rclone`, and `Fake` for trying the flow |
-| `internal/copier` | rclone as a library: connect to a bucket, copy, compare, count, preflight probes |
+| `internal/copier` | rclone as a library: connect to a bucket, copy, compare, sync one key, preflight probes |
+| `internal/eventsource` | Change feeds of source buckets: S3 through SQS, GCS through Pub/Sub, SeaweedFS through the filer |
+| `internal/routing` | Which route each app applied, and the keys apps deleted |
+| `client` | App storage module (Go reference implementation) |
+| `cmd/appsim`, `internal/appsim` | Simulated app servers for testing a switch on real buckets |
+| `internal/e2e` | API, worker and apps together on in-memory buckets |
+| `internal/creds` | Resolves endpoint credential references |
 | `internal/migration` | Migration types, phases, and which commands each phase accepts. No I/O |
 | `internal/store` | Storage shared by the API and the worker. In-memory for now |
 
-Planned packages: `internal/eventsource` (SQS, Pub/Sub, SeaweedFS change feeds), `internal/routing` (active bucket for app servers).
+Not yet: restart recovery (state is in memory; M7), metrics and server-to-server authentication (M8).

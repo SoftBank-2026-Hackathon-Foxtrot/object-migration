@@ -11,9 +11,12 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
+	"strconv"
 	"time"
 
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/routing"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 )
 
@@ -35,8 +38,15 @@ type Deps struct {
 	// Preflight runs the access checks of POST /v1/preflight. Nil checks
 	// only the request.
 	Preflight Preflighter
-	Logger    *slog.Logger
-	Now       func() time.Time
+	// Apps records the route each app reports having applied. Nil drops
+	// the reports.
+	Apps *routing.Apps
+	// Deletes records the keys apps delete during a migration.
+	Deletes *routing.Deletes
+	// Directions, when set, is reported by /v1/capabilities.
+	Directions any
+	Logger     *slog.Logger
+	Now        func() time.Time
 }
 
 type handler struct {
@@ -65,6 +75,8 @@ func NewHandler(d Deps) http.Handler {
 	mux.HandleFunc("POST /v1/preflight", h.preflight)
 	mux.HandleFunc("POST /v1/migrations", h.idem.wrap(h.create))
 	mux.HandleFunc("GET /v1/migrations/{id}", h.get)
+	mux.HandleFunc("GET /v1/migrations/{id}/routing", h.routing)
+	mux.HandleFunc("POST /v1/migrations/{id}/deletes", h.deletes)
 	mux.HandleFunc("POST /v1/migrations/{id}/{command}", h.idem.wrap(h.command))
 	mux.HandleFunc("DELETE /v1/migrations/{id}", h.idem.wrap(h.abort))
 	return mux
@@ -90,6 +102,7 @@ func (h *handler) capabilities(w http.ResponseWriter, _ *http.Request) {
 			migration.CommandFreeze, migration.CommandSwitch, migration.CommandResume,
 			migration.CommandRollback, migration.CommandFinalize, migration.CommandAbort,
 		},
+		"directions": h.Directions,
 	})
 }
 
@@ -162,6 +175,93 @@ func (h *handler) get(w http.ResponseWriter, r *http.Request) {
 	writeMigration(w, http.StatusOK, m)
 }
 
+// routeEndpoint is a bucket as apps see it: where it is, but not the
+// server's credentials for it. Apps use their own.
+type routeEndpoint struct {
+	Kind   migration.Kind `json:"kind"`
+	Bucket string         `json:"bucket"`
+	Region string         `json:"region,omitempty"`
+	URL    string         `json:"url,omitempty"`
+}
+
+type routeView struct {
+	MigrationID string          `json:"migrationId"`
+	Phase       migration.Phase `json:"phase"`
+	Generation  int64           `json:"generation"`
+	Write       routeEndpoint   `json:"write"`
+	Read        []routeEndpoint `json:"read"`
+	Delete      []routeEndpoint `json:"delete"`
+	// AppTTLMS is how long the server keeps waiting for an app that stopped
+	// asking. An app must stop using its route well before that.
+	AppTTLMS int64 `json:"appTtlMs,omitempty"`
+}
+
+// routing tells an app where to write and read. An app asks for it every
+// second or so, passing app (a name unique among the app's servers) and
+// applied (the generation it uses now), so a switch can wait for it.
+func (h *handler) routing(w http.ResponseWriter, r *http.Request) {
+	m, err := h.Store.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if app := r.URL.Query().Get("app"); app != "" && h.Apps != nil {
+		applied, err := strconv.ParseInt(r.URL.Query().Get("applied"), 10, 64)
+		if err != nil || applied < 0 {
+			writeError(w, badRequest("applied must be the generation the app uses, 0 if none"))
+			return
+		}
+		h.Apps.Report(m.ID, app, applied)
+	}
+	view := func(s migration.Side) routeEndpoint {
+		e := m.Endpoint(s)
+		return routeEndpoint{Kind: e.Kind, Bucket: e.Bucket, Region: e.Region, URL: e.URL}
+	}
+	v := routeView{MigrationID: m.ID, Phase: m.Phase, Generation: m.Routing.Generation, Write: view(m.Routing.Write)}
+	if h.Apps != nil {
+		v.AppTTLMS = h.Apps.TTL().Milliseconds()
+	}
+	for _, s := range m.Routing.Read {
+		v.Read = append(v.Read, view(s))
+	}
+	for _, s := range m.Routing.Delete {
+		v.Delete = append(v.Delete, view(s))
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, v)
+}
+
+type deletesBody struct {
+	Keys []string `json:"keys"`
+}
+
+// maxDeleteKeys bounds one POST .../deletes.
+const maxDeleteKeys = 1000
+
+// deletes records keys an app is about to delete, before it deletes them
+// from the buckets, so a copy running at the same time cannot bring them
+// back.
+func (h *handler) deletes(w http.ResponseWriter, r *http.Request) {
+	var body deletesBody
+	if err := decode(w, r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	if len(body.Keys) == 0 || len(body.Keys) > maxDeleteKeys || slices.Contains(body.Keys, "") {
+		writeError(w, badRequest(fmt.Sprintf("keys must hold 1 to %d non-empty keys", maxDeleteKeys)))
+		return
+	}
+	m, err := h.Store.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if h.Deletes != nil {
+		h.Deletes.Add(m.ID, body.Keys...)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // migrationView is a migration as the API returns it, with the commands the
 // client may send next.
 type migrationView struct {
@@ -183,6 +283,9 @@ var pathCommands = map[string]migration.Command{
 	"finalize": migration.CommandFinalize,
 }
 
+// maxDeadlineMS bounds how long a command may wait for apps: one hour.
+const maxDeadlineMS = 3_600_000
+
 type commandBody struct {
 	CutoverID       string `json:"cutoverId"`
 	DeadlineMS      int64  `json:"deadlineMs"`
@@ -200,8 +303,8 @@ func (h *handler) command(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if body.DeadlineMS < 0 || body.ExpectedVersion < 0 {
-		writeError(w, badRequest("deadlineMs and expectedVersion must not be negative"))
+	if body.DeadlineMS < 0 || body.DeadlineMS > maxDeadlineMS || body.ExpectedVersion < 0 {
+		writeError(w, badRequest(fmt.Sprintf("deadlineMs must be 0 to %d and expectedVersion not negative", maxDeadlineMS)))
 		return
 	}
 	h.request(w, r, migration.CommandRequest{

@@ -18,12 +18,18 @@ import (
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/api"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/copier"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/engine"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/routing"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/worker"
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	level := slog.LevelInfo
+	if os.Getenv("LOG_LEVEL") == "debug" {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+	copier.SetLogger(logger.Handler())
 	if err := run(logger); err != nil {
 		logger.Error("exit", "err", err)
 		os.Exit(1)
@@ -36,7 +42,7 @@ func run(logger *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	eng, defaultSync, err := newEngine()
+	eng, defaultSync, err := newEngine(logger)
 	if err != nil {
 		return err
 	}
@@ -45,17 +51,39 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	appTTL, err := durationEnv("APP_TTL", 10*time.Second)
+	if err != nil {
+		return err
+	}
+	confirm, err := durationEnv("CONFIRM_TIMEOUT", 30*time.Second)
+	if err != nil {
+		return err
+	}
+
 	st := store.NewMemory()
-	w := worker.New(st, eng, worker.Config{PollInterval: poll, RetryBackoff: poll, SyncInterval: syncInterval}, logger)
+	apps := routing.NewApps(appTTL)
+	deletes := routing.NewDeletes()
+	var directions any
+	if r, ok := eng.(*engine.Rclone); ok {
+		r.Deletes = deletes
+		directions = r.Directions()
+	}
+	w := worker.New(st, eng, worker.Config{
+		PollInterval: poll, RetryBackoff: poll, SyncInterval: syncInterval,
+		Apps: apps, ConfirmTimeout: confirm,
+	}, logger)
 
 	srv := &http.Server{
 		Addr: addr,
 		Handler: api.NewHandler(api.Deps{
-			Store:     st,
-			Notifier:  w,
-			Engine:    eng.Name(),
-			Preflight: eng,
-			Logger:    logger,
+			Store:      st,
+			Notifier:   w,
+			Engine:     eng.Name(),
+			Preflight:  eng,
+			Apps:       apps,
+			Deletes:    deletes,
+			Directions: directions,
+			Logger:     logger,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
@@ -95,9 +123,10 @@ func run(logger *slog.Logger) error {
 }
 
 // newEngine picks the engine from ENGINE and returns it with its default
-// wait between sync rounds. Each rclone round lists both buckets, so rounds
-// are spaced out; fake rounds cost nothing.
-func newEngine() (engine.Engine, time.Duration, error) {
+// wait between sync rounds. For sources without a change feed each rclone
+// round lists both buckets, so rounds are spaced out; sources with a feed
+// start the next round at once, and fake rounds cost nothing.
+func newEngine(logger *slog.Logger) (engine.Engine, time.Duration, error) {
 	switch name := envOr("ENGINE", "rclone"); name {
 	case "rclone":
 		transfers, err := intEnv("COPY_TRANSFERS", 16)
@@ -108,7 +137,13 @@ func newEngine() (engine.Engine, time.Duration, error) {
 		if err != nil {
 			return nil, 0, err
 		}
-		return engine.NewRclone(copier.Options{Transfers: transfers, Checkers: checkers}), 30 * time.Second, nil
+		eng := engine.NewRclone(copier.Options{Transfers: transfers, Checkers: checkers})
+		eng.Log = logger
+		eng.GCPProject = os.Getenv("GCP_PROJECT")
+		if eng.Stream.FullCopyInterval, err = durationEnv("FULL_COPY_INTERVAL", eng.Stream.FullCopyInterval); err != nil {
+			return nil, 0, err
+		}
+		return eng, 30 * time.Second, nil
 	case "fake":
 		delay, err := durationEnv("FAKE_STEP_DELAY", 2*time.Second)
 		if err != nil {

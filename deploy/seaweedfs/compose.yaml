@@ -1,0 +1,30 @@
+# SeaweedFS for the on-prem environment: one node running master, volume,
+# filer and the S3 gateway. The migration server reaches the S3 gateway on
+# 8333 and the filer's gRPC on 18888 (for its change feed), over Tailscale.
+#
+#   cp s3.json.example s3.json   # then put real keys in s3.json
+#   docker compose up -d
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.48
+    command: >-
+      server -dir=/data -ip.bind=0.0.0.0
+      -master.volumeSizeLimitMB=1024 -volume.max=0
+      -filer -s3 -s3.config=/etc/seaweedfs/s3.json
+    ports:
+      - "8333:8333"   # S3 API
+      - "8888:8888"   # filer HTTP
+      - "18888:18888" # filer gRPC: change feed
+      - "9333:9333"   # master
+    volumes:
+      - seaweedfs-data:/data
+      - ./s3.json:/etc/seaweedfs/s3.json:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9333/cluster/status"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+volumes:
+  seaweedfs-data:

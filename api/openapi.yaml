@@ -119,6 +119,76 @@ paths:
         "404": { $ref: "#/components/responses/Error" }
         "409": { $ref: "#/components/responses/Error" }
 
+  /v1/migrations/{id}/routing:
+    parameters:
+      - $ref: "#/components/parameters/MigrationID"
+    get:
+      summary: Where an app writes, reads and deletes now
+      description: >-
+        App servers ask about every second and report the generation they
+        use, so a route change can wait for every live app. See
+        docs/app-storage.md.
+      parameters:
+        - name: app
+          in: query
+          description: Name of the app server, unique among the app's servers.
+          schema: { type: string }
+        - name: applied
+          in: query
+          description: Route generation the app uses now; 0 before it has one.
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: Route. Endpoints carry no credentials.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [migrationId, phase, generation, write, read, delete]
+                properties:
+                  migrationId: { type: string }
+                  phase: { $ref: "#/components/schemas/Phase" }
+                  generation: { type: integer }
+                  write: { $ref: "#/components/schemas/RouteEndpoint" }
+                  read:
+                    type: array
+                    description: In order; an object not found in one is looked up in the next.
+                    items: { $ref: "#/components/schemas/RouteEndpoint" }
+                  delete:
+                    type: array
+                    description: Every bucket that may hold a copy, in the order to delete from.
+                    items: { $ref: "#/components/schemas/RouteEndpoint" }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
+  /v1/migrations/{id}/deletes:
+    parameters:
+      - $ref: "#/components/parameters/MigrationID"
+    post:
+      summary: Record keys an app is about to delete
+      description: >-
+        While the route deletes from more than one bucket, an app records a
+        key here before deleting it. Every copy the server makes afterwards
+        removes its copy of a recorded key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keys]
+              additionalProperties: false
+              properties:
+                keys:
+                  type: array
+                  minItems: 1
+                  maxItems: 1000
+                  items: { type: string, minLength: 1 }
+      responses:
+        "204": { description: Recorded }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
   /v1/migrations/{id}/{command}:
     parameters:
       - $ref: "#/components/parameters/MigrationID"
@@ -196,6 +266,13 @@ components:
         url:
           type: string
           description: S3-compatible endpoint. Required for seaweedfs.
+        filer:
+          type: string
+          description: >-
+            seaweedfs only: the filer's gRPC address, host:port. With it the
+            server follows the bucket's changes as they happen; without it
+            the bucket is mirrored in full every sync round.
+          example: 100.64.0.7:18888
         ref:
           type: string
           description: >-
@@ -206,6 +283,15 @@ components:
             NAME_SESSION_TOKEN for s3 and seaweedfs, or NAME_CREDENTIALS_FILE
             (a service account key file) for gcs.
           example: env:AWS_SOURCE
+
+    RouteEndpoint:
+      type: object
+      required: [kind, bucket]
+      properties:
+        kind: { $ref: "#/components/schemas/Kind" }
+        bucket: { type: string }
+        region: { type: string }
+        url: { type: string }
 
     EndpointsRequest:
       type: object
@@ -300,10 +386,23 @@ components:
         detail: { type: string, description: Server-specific sub-step for dashboards. }
         source: { $ref: "#/components/schemas/Endpoint" }
         target: { $ref: "#/components/schemas/Endpoint" }
+        routing:
+          type: object
+          description: The route apps use now, by side.
+          properties:
+            generation: { type: integer }
+            write: { type: string, enum: [source, target] }
+            read: { type: array, items: { type: string, enum: [source, target] } }
+            delete: { type: array, items: { type: string, enum: [source, target] } }
         replication:
           type: object
           required: [forward, reverse, initialCopy]
-          description: How data is moving now. Forward is source to target; reverse is target to source after the switch.
+          description: >-
+            How data is moving now. Forward is source to target; reverse is
+            target to source after the switch. For a flow that follows a
+            change feed, backlog is about how many changes wait in the feed
+            and lagSeconds is the p95 time from a change in one bucket to
+            the other over the last round.
           properties:
             forward: { $ref: "#/components/schemas/Flow" }
             reverse: { $ref: "#/components/schemas/Flow" }

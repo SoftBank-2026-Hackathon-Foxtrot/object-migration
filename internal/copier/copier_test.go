@@ -1,10 +1,12 @@
 package copier
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -101,8 +103,8 @@ func TestCopyKeepsTargetOnlyObjects(t *testing.T) {
 		t.Fatalf("copy deleted a target-only object: %v", err)
 	}
 	d, err := Check(ctx, src, dst, Options{})
-	if err != nil || !d.Same() {
-		t.Fatalf("check: %+v, %v", d, err)
+	if err != nil || d.Same() || d.Extra != 1 || d.ExtraKeys[0] != "only-in-target" || d.Missing != 0 {
+		t.Fatalf("check: %+v, %v; want the target-only object reported", d, err)
 	}
 }
 
@@ -186,5 +188,107 @@ func TestProbes(t *testing.T) {
 	n, _, err := Count(ctx, f)
 	if err != nil || n != 3 {
 		t.Fatalf("probe object left behind: %d objects, %v", n, err)
+	}
+}
+
+func TestSyncKeyFollowsTheSource(t *testing.T) {
+	ctx := context.Background()
+	src, dst := memFs(t, "src"), memFs(t, "dst")
+	put(t, src, "a", "one")
+	put(t, dst, "keep", "x") // the bucket must exist for the memory backend
+
+	steps := []struct {
+		name string
+		do   func()
+		want Action
+	}{
+		{"new object", func() {}, Copied},
+		{"again", func() {}, Unchanged},
+		{"changed", func() { put(t, src, "a", "two!") }, Copied},
+		{"deleted", func() {
+			if err := Delete(ctx, src, "a"); err != nil {
+				t.Fatal(err)
+			}
+		}, Deleted},
+		{"deleted again", func() {}, Unchanged},
+	}
+	for _, s := range steps {
+		s.do()
+		got, err := SyncKey(ctx, src, dst, "a")
+		if err != nil || got != s.want {
+			t.Fatalf("%s: %q, %v; want %q", s.name, got, err, s.want)
+		}
+	}
+	if _, err := dst.NewObject(ctx, "keep"); err != nil {
+		t.Fatalf("other objects were touched: %v", err)
+	}
+}
+
+func TestInternalObjectsAreLeftOut(t *testing.T) {
+	ctx := context.Background()
+	src, dst := memFs(t, "src"), memFs(t, "dst")
+	fill(t, src, 3)
+	put(t, src, ProbePrefix+"canary-1", "x")
+
+	res, err := Copy(ctx, src, dst, Options{}, nil)
+	if err != nil || res.Copied != 3 {
+		t.Fatalf("copy: %+v, %v", res, err)
+	}
+	if _, err := dst.NewObject(ctx, ProbePrefix+"canary-1"); err == nil {
+		t.Fatal("internal object was copied")
+	}
+	n, _, err := Count(ctx, src)
+	if err != nil || n != 3 {
+		t.Fatalf("count = %d, %v", n, err)
+	}
+	d, err := Check(ctx, src, dst, Options{})
+	if err != nil || !d.Same() {
+		t.Fatalf("check: %+v, %v", d, err)
+	}
+}
+
+func TestCheckNamesMissingKeys(t *testing.T) {
+	ctx := context.Background()
+	src, dst := memFs(t, "src"), memFs(t, "dst")
+	put(t, src, "x/one", "1")
+	put(t, src, "x/two", "2")
+	put(t, dst, "x/one", "1")
+	d, err := Check(ctx, src, dst, Options{})
+	if err != nil || d.Missing != 1 || len(d.MissingKeys) != 1 || d.MissingKeys[0] != "x/two" {
+		t.Fatalf("diff = %+v, %v", d, err)
+	}
+}
+
+func TestMirrorDeletesTargetOnlyObjects(t *testing.T) {
+	ctx := context.Background()
+	src, dst := memFs(t, "src"), memFs(t, "dst")
+	fill(t, src, 4)
+	put(t, dst, "stale", "deleted from the source long ago")
+	put(t, dst, ProbePrefix+"preflight-x", "internal")
+
+	res, err := Mirror(ctx, src, dst, Options{}, nil)
+	if err != nil || res.Copied != 4 || res.Deleted != 1 {
+		t.Fatalf("mirror: %+v, %v", res, err)
+	}
+	if _, err := dst.NewObject(ctx, "stale"); err == nil {
+		t.Fatal("stale object kept")
+	}
+	if _, err := dst.NewObject(ctx, ProbePrefix+"preflight-x"); err != nil {
+		t.Fatalf("internal object deleted: %v", err)
+	}
+	d, err := Check(ctx, src, dst, Options{})
+	if err != nil || !d.Same() {
+		t.Fatalf("check: %+v, %v", d, err)
+	}
+}
+
+func TestSetLoggerDropsComparisonLines(t *testing.T) {
+	var buf bytes.Buffer
+	h := rcloneHandler{slog.NewTextHandler(&buf, nil)}
+	log := slog.New(h).With("object", "a.txt")
+	log.Error("file not in S3 bucket dst")
+	log.Error("failed to copy: access denied")
+	if got := buf.String(); strings.Contains(got, "file not in") || !strings.Contains(got, "access denied") {
+		t.Fatalf("log = %q", got)
 	}
 }

@@ -5,6 +5,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
 )
@@ -24,6 +25,9 @@ type Engine interface {
 	// Preflight checks that both buckets can be reached with the access the
 	// migration needs, without changing anything the app can see.
 	Preflight(ctx context.Context, source, target migration.Endpoint) []migration.Check
+	// Prepare starts following changes in the source before anything is
+	// copied, so no change made during the initial copy is missed.
+	Prepare(ctx context.Context, m migration.Migration) error
 	// InitialSync copies everything already in the source. report may be
 	// called any number of times with the latest progress.
 	InitialSync(ctx context.Context, m migration.Migration, report func(migration.Progress)) error
@@ -39,6 +43,10 @@ type Engine interface {
 	Finalize(ctx context.Context, m migration.Migration) error
 	Rollback(ctx context.Context, m migration.Migration) error
 	Abort(ctx context.Context, m migration.Migration) error
+	// Release removes what Prepare set up. It runs once a migration is
+	// over, however it ended, and also when Prepare never ran or ran only
+	// in part.
+	Release(ctx context.Context, m migration.Migration) error
 }
 
 // SyncReport is the result of one incremental sync round.
@@ -46,6 +54,10 @@ type SyncReport struct {
 	Cutover    migration.Decision
 	Backlog    int64
 	LagSeconds float64
+	// Wait, when set, is how long until the next round instead of the
+	// worker's SyncInterval. An engine that follows changes as they happen
+	// asks for the next round soon.
+	Wait time.Duration
 }
 
 // VerifyReport is the result of comparing source and target after resume.

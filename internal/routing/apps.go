@@ -1,0 +1,96 @@
+// Package routing keeps track of which route each app server has applied,
+// so a switch can wait until every live app reads and writes where it
+// should before taking the next step.
+package routing
+
+import (
+	"context"
+	"slices"
+	"sync"
+	"time"
+)
+
+// Apps records, per migration, the route generation each app reported
+// when it last asked for its route. An app that has not asked for longer
+// than the TTL is taken to be gone and is not waited for.
+type Apps struct {
+	ttl time.Duration
+	now func() time.Time
+
+	mu   sync.Mutex
+	seen map[string]map[string]report
+}
+
+type report struct {
+	applied int64
+	at      time.Time
+}
+
+func NewApps(ttl time.Duration) *Apps {
+	return &Apps{ttl: ttl, now: time.Now, seen: make(map[string]map[string]report)}
+}
+
+// TTL is how long an app may go without asking before it is not waited for.
+func (a *Apps) TTL() time.Duration { return a.ttl }
+
+// Report records that app uses generation applied of a migration's route.
+func (a *Apps) Report(migration, app string, applied int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	apps, ok := a.seen[migration]
+	if !ok {
+		apps = make(map[string]report)
+		a.seen[migration] = apps
+	}
+	apps[app] = report{applied: applied, at: a.now()}
+}
+
+// Waiting returns the live apps that have not applied generation gen yet,
+// sorted by name.
+func (a *Apps) Waiting(migration string, gen int64) []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var waiting []string
+	for app, r := range a.seen[migration] {
+		if a.now().Sub(r.at) <= a.ttl && r.applied < gen {
+			waiting = append(waiting, app)
+		}
+	}
+	slices.Sort(waiting)
+	return waiting
+}
+
+// Live returns how many apps asked for the route within the TTL.
+func (a *Apps) Live(migration string) int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := 0
+	for _, r := range a.seen[migration] {
+		if a.now().Sub(r.at) <= a.ttl {
+			n++
+		}
+	}
+	return n
+}
+
+// Wait returns once every live app has applied generation gen, or with
+// ctx's error.
+func (a *Apps) Wait(ctx context.Context, migration string, gen int64) error {
+	t := time.NewTicker(20 * time.Millisecond)
+	defer t.Stop()
+	for len(a.Waiting(migration, gen)) > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+	return nil
+}
+
+// Forget drops what is known about a migration's apps.
+func (a *Apps) Forget(migration string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.seen, migration)
+}

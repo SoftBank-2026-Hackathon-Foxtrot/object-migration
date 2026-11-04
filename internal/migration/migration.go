@@ -31,6 +31,10 @@ type Endpoint struct {
 	Region string `json:"region,omitempty"`
 	// URL is the S3-compatible endpoint. Required for seaweedfs.
 	URL string `json:"url,omitempty"`
+	// Filer is a seaweedfs filer's gRPC address, host:port. With it the
+	// server follows the bucket's changes as they happen; without it the
+	// bucket is mirrored in full every sync round.
+	Filer string `json:"filer,omitempty"`
 	// Ref points to credentials in the secret store, never the secret itself.
 	Ref string `json:"ref"`
 }
@@ -49,6 +53,9 @@ func (e Endpoint) Validate() error {
 		}
 	default:
 		return fmt.Errorf("unknown kind %q", e.Kind)
+	}
+	if e.Filer != "" && e.Kind != KindSeaweedFS {
+		return errors.New("filer is only for seaweedfs")
 	}
 	if e.Bucket == "" {
 		return errors.New("bucket is required")
@@ -249,17 +256,19 @@ type Error struct {
 
 // Migration is one source-to-target object migration.
 type Migration struct {
-	ID          string          `json:"id"`
-	Type        string          `json:"type"`
-	Phase       Phase           `json:"phase"`
-	State       State           `json:"state"`
-	Detail      string          `json:"detail,omitempty"`
-	Source      Endpoint        `json:"source"`
-	Target      Endpoint        `json:"target"`
-	Replication Replication     `json:"replication"`
-	Readiness   Readiness       `json:"readiness"`
-	Pending     *CommandRequest `json:"pendingCommand,omitempty"`
-	LastError   *Error          `json:"lastError"`
+	ID          string      `json:"id"`
+	Type        string      `json:"type"`
+	Phase       Phase       `json:"phase"`
+	State       State       `json:"state"`
+	Detail      string      `json:"detail,omitempty"`
+	Source      Endpoint    `json:"source"`
+	Target      Endpoint    `json:"target"`
+	Replication Replication `json:"replication"`
+	Readiness   Readiness   `json:"readiness"`
+	// Routing is where apps read and write the migrated objects.
+	Routing   Route           `json:"routing"`
+	Pending   *CommandRequest `json:"pendingCommand,omitempty"`
+	LastError *Error          `json:"lastError"`
 	// Version increases on every write so concurrent writers can detect
 	// conflicts.
 	Version   int64     `json:"version"`
@@ -309,6 +318,7 @@ func New(source, target Endpoint, now time.Time) (Migration, error) {
 			// Nothing has moved yet, so going back is always possible.
 			Rollback: Decide(Check{Name: "source_unchanged", OK: true}),
 		},
+		Routing:   Route{Generation: 1, Write: SideSource, Read: []Side{SideSource}, Delete: slices.Clone(both)},
 		CreatedAt: now,
 		UpdatedAt: now,
 	}, nil
@@ -321,7 +331,14 @@ func (m *Migration) RequestCommand(req CommandRequest) error {
 		if m.Pending.Command == req.Command && m.Pending.IdempotencyKey == req.IdempotencyKey {
 			return nil
 		}
-		return fmt.Errorf("%w: %s", ErrCommandPending, m.Pending.Command)
+		// A switch stuck waiting for apps that never confirm would otherwise
+		// leave no way out. A stuck finalize is not replaced: it may already
+		// have stopped apps reading the source, and going back from there
+		// would lose deletes made since.
+		stuck := m.State == StateUnknown && m.Pending.Command == CommandSwitch
+		if !stuck || req.Command != CommandRollback {
+			return fmt.Errorf("%w: %s", ErrCommandPending, m.Pending.Command)
+		}
 	}
 	if req.ExpectedVersion != 0 && req.ExpectedVersion != m.Version {
 		return fmt.Errorf("%w: expected %d, current %d", ErrVersionMismatch, req.ExpectedVersion, m.Version)
@@ -380,6 +397,8 @@ func (m Migration) Clone() Migration {
 	c.Readiness.Cutover.Checks = slices.Clone(m.Readiness.Cutover.Checks)
 	c.Readiness.Advance.Checks = slices.Clone(m.Readiness.Advance.Checks)
 	c.Readiness.Rollback.Checks = slices.Clone(m.Readiness.Rollback.Checks)
+	c.Routing.Read = slices.Clone(m.Routing.Read)
+	c.Routing.Delete = slices.Clone(m.Routing.Delete)
 	if m.Pending != nil {
 		p := *m.Pending
 		c.Pending = &p
@@ -395,4 +414,74 @@ func newID() string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return "om-" + hex.EncodeToString(b)
+}
+
+// Side names one bucket of a migration.
+type Side string
+
+const (
+	SideSource Side = "source"
+	SideTarget Side = "target"
+)
+
+// Route tells apps where to write, in which order to read, and where to
+// delete. An object missing from the first read side is looked up in the
+// next. Generation grows with every change, so apps can say which route
+// they use.
+type Route struct {
+	Generation int64  `json:"generation"`
+	Write      Side   `json:"write"`
+	Read       []Side `json:"read"`
+	// Delete lists every side that may hold a copy, in the order to delete
+	// from. While both do, a delete goes to both, or a read falling back to
+	// the other side would find the object again. The target comes first:
+	// the reverse copy reads the target, and checks after each copy that
+	// the object is still there.
+	Delete []Side `json:"delete"`
+}
+
+// The routes a migration moves through. Each step changes one thing and
+// waits for every app, so two apps are never more than one step apart:
+//
+//   - Writes move only once every app reads both sides, so an object
+//     written by any app is readable by every app.
+//   - Deletes stop going to a side only once no app reads it any more, so
+//     a deleted object cannot be found on the other side.
+var (
+	both = []Side{SideTarget, SideSource}
+
+	RouteSource = Route{Write: SideSource, Read: []Side{SideSource}, Delete: both}
+	RouteBoth   = Route{Write: SideSource, Read: []Side{SideSource, SideTarget}, Delete: both}
+	RouteTarget = Route{Write: SideTarget, Read: []Side{SideTarget, SideSource}, Delete: both}
+	// RouteTargetAlone reads only the target but still deletes from both,
+	// for apps still reading the source.
+	RouteTargetAlone = Route{Write: SideTarget, Read: []Side{SideTarget}, Delete: both}
+	RouteTargetOnly  = Route{Write: SideTarget, Read: []Side{SideTarget}, Delete: []Side{SideTarget}}
+	// RouteSourceOnly is where an aborted or rolled back migration ends:
+	// the target is no longer the app's business.
+	RouteSourceOnly = Route{Write: SideSource, Read: []Side{SideSource}, Delete: []Side{SideSource}}
+)
+
+// SetRoute moves the migration to r unless it is there already, and
+// returns the generation apps must apply. Setting the same route again
+// keeps the generation, so a retried step waits for the same apps.
+func (m *Migration) SetRoute(r Route) int64 {
+	if m.Routing.Write == r.Write && slices.Equal(m.Routing.Read, r.Read) && slices.Equal(m.Routing.Delete, r.Delete) {
+		return m.Routing.Generation
+	}
+	m.Routing = Route{
+		Generation: m.Routing.Generation + 1,
+		Write:      r.Write,
+		Read:       slices.Clone(r.Read),
+		Delete:     slices.Clone(r.Delete),
+	}
+	return m.Routing.Generation
+}
+
+// Endpoint returns the endpoint on a side.
+func (m Migration) Endpoint(s Side) Endpoint {
+	if s == SideTarget {
+		return m.Target
+	}
+	return m.Source
 }
