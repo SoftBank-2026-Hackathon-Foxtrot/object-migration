@@ -15,6 +15,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/api"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/copier"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/engine"
@@ -60,17 +64,16 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
-	st, deletes, closeStore, err := openStore(logger)
+	st, deletes, err := openStore(logger)
 	if err != nil {
 		return err
 	}
-	defer closeStore()
 	apps := routing.NewApps(appTTL)
 	var directions any
 	if r, ok := eng.(*engine.Rclone); ok {
 		r.Deletes = deletes
-		if pg, ok := st.(*store.Postgres); ok {
-			r.Positions = pg
+		if d, ok := st.(*store.Dynamo); ok {
+			r.Positions = d
 		}
 		directions = r.Directions()
 	}
@@ -128,26 +131,36 @@ func run(logger *slog.Logger) error {
 	return err
 }
 
-// openStore keeps migrations in PostgreSQL when DATABASE_URL is set, so a
-// restarted server goes on with them, and in memory otherwise.
-func openStore(logger *slog.Logger) (store.Store, *routing.Deletes, func(), error) {
-	url := os.Getenv("DATABASE_URL")
-	if url == "" {
-		logger.Warn("DATABASE_URL not set; migrations are lost when the server stops")
-		return store.NewMemory(), routing.NewDeletes(), func() {}, nil
+// openStore keeps migrations in the service's DynamoDB table when
+// DYNAMODB_TABLE is set, so a restarted server goes on with them, and in
+// memory otherwise. The table is reached with the platform's own AWS
+// credentials (the SDK's default chain), not an endpoint's.
+func openStore(logger *slog.Logger) (store.Store, *routing.Deletes, error) {
+	table := os.Getenv("DYNAMODB_TABLE")
+	if table == "" {
+		logger.Warn("DYNAMODB_TABLE not set; migrations are lost when the server stops")
+		return store.NewMemory(), routing.NewDeletes(), nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	pg, err := store.OpenPostgres(ctx, url)
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(envOr("DYNAMODB_REGION", "ap-northeast-1")))
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("DATABASE_URL: %w", err)
+		return nil, nil, fmt.Errorf("DYNAMODB_TABLE: %w", err)
 	}
-	deletes, err := routing.LoadDeletes(ctx, pg)
+	db := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+		if ep := os.Getenv("DYNAMODB_ENDPOINT"); ep != "" {
+			o.BaseEndpoint = aws.String(ep)
+		}
+	})
+	d, err := store.OpenDynamo(ctx, db, table)
 	if err != nil {
-		pg.Close()
-		return nil, nil, nil, fmt.Errorf("load deleted keys: %w", err)
+		return nil, nil, fmt.Errorf("DYNAMODB_TABLE: %w", err)
 	}
-	return pg, deletes, pg.Close, nil
+	deletes, err := routing.LoadDeletes(ctx, d)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load deleted keys: %w", err)
+	}
+	return d, deletes, nil
 }
 
 // newEngine picks the engine from ENGINE and returns it with its default

@@ -3,37 +3,49 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
 )
 
 var ctx = context.Background()
 
-// eachStore runs a test against the memory store and, when OM_POSTGRES_URL
-// names a database, against an emptied Postgres store.
+// eachStore runs a test against the memory store and, when
+// OM_DYNAMODB_ENDPOINT names a DynamoDB endpoint (DynamoDB Local), against a
+// Dynamo store on a new table.
 func eachStore(t *testing.T, test func(t *testing.T, s Store)) {
 	t.Run("memory", func(t *testing.T) { test(t, NewMemory()) })
-	t.Run("postgres", func(t *testing.T) { test(t, emptyPostgres(t)) })
+	t.Run("dynamo", func(t *testing.T) { test(t, emptyDynamo(t)) })
 }
 
-func emptyPostgres(t *testing.T) *Postgres {
+// emptyDynamo opens a store on a table of its own, dropped after the test.
+func emptyDynamo(t *testing.T) *Dynamo {
 	t.Helper()
-	url := os.Getenv("OM_POSTGRES_URL")
-	if url == "" {
-		t.Skip("OM_POSTGRES_URL not set")
+	endpoint := os.Getenv("OM_DYNAMODB_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("OM_DYNAMODB_ENDPOINT not set")
 	}
-	s, err := OpenPostgres(ctx, url)
+	db := dynamodb.New(dynamodb.Options{
+		Region:       "ap-northeast-1",
+		BaseEndpoint: aws.String(endpoint),
+		Credentials:  credentials.NewStaticCredentialsProvider("local", "local", ""),
+	})
+	table := fmt.Sprintf("om-test-%d", time.Now().UnixNano())
+	s, err := OpenDynamo(ctx, db, table)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(s.Close)
-	if _, err := s.pool.Exec(ctx, `TRUNCATE migrations, deleted_keys, feed_positions, idempotency_keys`); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() {
+		_, _ = db.DeleteTable(context.Background(), &dynamodb.DeleteTableInput{TableName: &table})
+	})
 	return s
 }
 

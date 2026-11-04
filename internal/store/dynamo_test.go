@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -8,8 +9,8 @@ import (
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
 )
 
-func TestPostgresKeepsAWholeMigration(t *testing.T) {
-	s := emptyPostgres(t)
+func TestDynamoKeepsAWholeMigration(t *testing.T) {
+	s := emptyDynamo(t)
 	m := create(t, s)
 	m.Phase, m.State = migration.PhaseSwitched, migration.StateWaiting
 	m.SetRoute(migration.RouteTarget)
@@ -30,8 +31,8 @@ func TestPostgresKeepsAWholeMigration(t *testing.T) {
 	}
 }
 
-func TestPostgresKeepsDeletesAndFeedPositions(t *testing.T) {
-	s := emptyPostgres(t)
+func TestDynamoKeepsDeletesAndFeedPositions(t *testing.T) {
+	s := emptyDynamo(t)
 	at := time.Now().Truncate(time.Microsecond)
 	if err := s.RecordDeletes(ctx, "m1", []string{"a", "b"}, at); err != nil {
 		t.Fatal(err)
@@ -72,5 +73,25 @@ func TestPostgresKeepsDeletesAndFeedPositions(t *testing.T) {
 	}
 	if pos, _ := s.FeedPosition(ctx, "m1"); pos != "" {
 		t.Fatalf("position after forget = %q", pos)
+	}
+}
+
+func TestDynamoForgetsManyDeletes(t *testing.T) {
+	s := emptyDynamo(t)
+	keys := make([]string, 60) // more than one batch
+	for i := range keys {
+		keys[i] = fmt.Sprintf("dir/key-%02d", i)
+	}
+	if err := s.RecordDeletes(ctx, "m1", keys, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if all, _ := s.LoadDeletes(ctx); len(all["m1"]) != len(keys) {
+		t.Fatalf("loaded %d keys, want %d", len(all["m1"]), len(keys))
+	}
+	if err := s.ForgetDeletes(ctx, "m1"); err != nil {
+		t.Fatal(err)
+	}
+	if all, _ := s.LoadDeletes(ctx); len(all["m1"]) != 0 {
+		t.Fatalf("%d keys left after forget", len(all["m1"]))
 	}
 }
