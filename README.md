@@ -137,11 +137,14 @@ curl -s -X POST localhost:8080/v1/migrations/$ID/resume       # wait for VERIFYI
 curl -s -X POST localhost:8080/v1/migrations/$ID/finalize
 ```
 
-Simulate app servers during a migration with `appsim`: it writes, reads each other's objects and deletes through the app storage module, counts every failed request, and writes the keys it left and deleted to compare with the buckets.
+Simulate app servers during a migration with `appsim`: it writes, reads each other's objects and deletes through the app storage module, counts every failed request, and writes the keys it left and deleted to compare with the buckets. It reports request times per migration step (the route each app held when it sent the request) and the longest time an app went without a successful write, and logs every request to `requests.csv` in `-out`. With `-direct` it sends the same requests straight to one bucket, without a migration, as a baseline.
 
 ```sh
 AWS_PROFILE=foxtrot go run ./cmd/appsim -migration $ID -apps 3 -for 5m
+AWS_PROFILE=foxtrot go run ./cmd/appsim -direct s3 -bucket foxtrot-om-src-test -region ap-northeast-1 -for 3m
 ```
+
+Measured on real buckets, S3 → GCS: [request latency per step](https://softbank-2026-hackathon-foxtrot.github.io/design-docs/object-storage/latency/).
 
 The API is described in [api/openapi.yaml](api/openapi.yaml); what an app's storage module does is in [docs/app-storage.md](docs/app-storage.md).
 
