@@ -242,6 +242,9 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 
 	switch m.Phase {
 	case migration.PhaseCreated:
+		if m.Plan != nil {
+			return w.cfg.PollInterval, nil // a plan waits for PREPARE
+		}
 		if err := w.engine.Prepare(ctx, m); err != nil {
 			return 0, err
 		}
@@ -384,6 +387,11 @@ func (w *Worker) runCommand(ctx context.Context, m migration.Migration) error {
 		before, after func(*migration.Migration)
 	)
 	switch cmd.Command {
+	case migration.CommandPrepare:
+		return w.prepare(ctx, m, cmd)
+	case migration.CommandStartSync:
+		to, state = migration.PhaseInitialSync, migration.StateRunning
+		before = func(x *migration.Migration) { x.Replication.Forward.State = migration.FlowInitialCopy }
 	case migration.CommandFreeze:
 		act, to, state = w.engine.Freeze, migration.PhaseFrozen, migration.StateWaiting
 	case migration.CommandSwitch:
@@ -468,6 +476,51 @@ func (w *Worker) runCommand(ctx context.Context, m migration.Migration) error {
 			after(x)
 		}
 		return w.enter(x, to, state)
+	})
+}
+
+// prepare runs PREPARE for a plan: the access checks of preflight, then
+// the engine's Prepare. A check that fails, or a target that is not clean,
+// fails the operation and leaves the plan in CREATED to be fixed and
+// prepared again.
+func (w *Worker) prepare(ctx context.Context, m migration.Migration, cmd migration.CommandRequest) error {
+	var failed []string
+	for _, c := range w.engine.Preflight(ctx, m.Source, m.Target) {
+		if !c.OK {
+			failed = append(failed, c.Name+": "+c.Message)
+		}
+	}
+	err := error(nil)
+	if len(failed) == 0 {
+		err = w.engine.Prepare(ctx, m)
+		if err != nil && !errors.Is(err, engine.ErrPermanent) {
+			return err // retried
+		}
+	}
+	if len(failed) > 0 || err != nil {
+		msg := strings.Join(failed, "; ")
+		if err != nil {
+			msg = err.Error()
+			// Prepare may have set up part of the feed.
+			if relErr := w.engine.Release(ctx, m); relErr != nil {
+				return relErr
+			}
+		}
+		return w.mutate(ctx, m.ID, func(x *migration.Migration) error {
+			if !sameRequest(x.Pending, cmd) {
+				return nil
+			}
+			x.LastError = &migration.Error{Code: "PRECONDITION_FAILED", Message: msg}
+			x.FailActive(msg, w.now())
+			return nil
+		})
+	}
+	return w.mutate(ctx, m.ID, func(x *migration.Migration) error {
+		if !sameRequest(x.Pending, cmd) {
+			return nil
+		}
+		x.Pending, x.LastError = nil, nil
+		return w.enter(x, migration.PhasePrepared, migration.StateWaiting)
 	})
 }
 
@@ -603,6 +656,9 @@ func (w *Worker) recordError(ctx context.Context, id string, cause error, perman
 	return w.mutate(ctx, id, func(x *migration.Migration) error {
 		if errors.Is(cause, ErrUnconfirmed) {
 			x.LastError = &migration.Error{Code: "APPS_NOT_CONFIRMED", Message: cause.Error(), Retryable: true}
+			if x.State != migration.StateUnknown {
+				x.Reconciled = false // a new unknown outcome needs a new RECONCILE
+			}
 			x.State = migration.StateUnknown
 			return nil
 		}

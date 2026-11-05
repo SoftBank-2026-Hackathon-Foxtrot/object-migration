@@ -9,11 +9,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/api"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/engine"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/worker"
 )
@@ -110,7 +112,7 @@ func TestMigrationFlowOverHTTP(t *testing.T) {
 
 	// A command in the wrong phase is rejected.
 	r := c.expect(c.call(http.MethodPost, "/v1/migrations/"+id+"/switch", ""), http.StatusConflict)
-	if r.body["code"] != "INVALID_PHASE" {
+	if r.body["code"] != "INVALID_STATE" {
 		t.Fatalf("code = %v", r.body["code"])
 	}
 
@@ -119,7 +121,7 @@ func TestMigrationFlowOverHTTP(t *testing.T) {
 	c.waitFor(id, "FROZEN", "")
 
 	// Retrying after the worker already ran it replays the first answer
-	// instead of failing with INVALID_PHASE.
+	// instead of failing with INVALID_STATE.
 	again := c.expect(c.call(http.MethodPost, "/v1/migrations/"+id+"/freeze", freeze, "Idempotency-Key", "freeze-1"), http.StatusAccepted)
 	if again.raw != first.raw || again.header.Get("Idempotent-Replayed") != "true" {
 		t.Fatalf("retry was not replayed: %s", again.raw)
@@ -142,8 +144,8 @@ func TestMigrationFlowOverHTTP(t *testing.T) {
 	c.expect(c.call(http.MethodPost, "/v1/migrations/"+id+"/rollback", ""), http.StatusConflict)
 }
 
-// TestActionFlowOverHTTP drives a migration with the common API's actions
-// and follows each one through GET /v1/operations/{id}.
+// TestActionFlowOverHTTP drives a plan through the common API, from
+// create to FINALIZE, following each action at GET /v1/operations/{id}.
 func TestActionFlowOverHTTP(t *testing.T) {
 	st := store.NewMemory()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -153,7 +155,11 @@ func TestActionFlowOverHTTP(t *testing.T) {
 	go func() { _ = w.Run(ctx); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
 
-	srv := httptest.NewServer(api.NewHandler(api.Deps{Store: st, Notifier: w, Engine: "fake", Logger: log, Token: "t"}))
+	resources := map[string]migration.Endpoint{
+		"aws": {Kind: migration.KindS3, Bucket: "foxtrot-src", Region: "ap-northeast-2", Ref: "env:AWS"},
+		"gcp": {Kind: migration.KindGCS, Bucket: "foxtrot-dst", Ref: "env:GCP"},
+	}
+	srv := httptest.NewServer(api.NewHandler(api.Deps{Store: st, Notifier: w, Engine: "fake", Logger: log, Token: "t", Resources: resources}))
 	t.Cleanup(srv.Close)
 	c := client{t: t, url: srv.URL}
 	auth := []string{"Authorization", "Bearer t"}
@@ -161,23 +167,30 @@ func TestActionFlowOverHTTP(t *testing.T) {
 		return c.expect(c.call(http.MethodGet, path, "", auth...), http.StatusOK).body
 	}
 
-	created := c.expect(c.call(http.MethodPost, "/v1/migrations",
-		`{"source":{"kind":"s3","bucket":"foxtrot-src","region":"ap-northeast-2","ref":"env:AWS"},"target":{"kind":"gcs","bucket":"foxtrot-dst","ref":"env:GCP"}}`,
-		auth...), http.StatusAccepted)
-	id := created.body["id"].(string)
+	caps := get("/v1/capabilities")
+	if profiles, _ := caps["profiles"].([]any); caps["apiVersion"] != "v1" || len(profiles) != 1 {
+		t.Fatalf("capabilities = %v", caps)
+	}
 
-	waitLifecycle := func(want string) map[string]any {
+	created := c.expect(c.call(http.MethodPost, "/v1/migrations",
+		`{"workflowId":"wf-1","resourceId":"receipts","kind":"OBJECT_STORAGE","profile":"object-copy-route-v1",`+
+			`"sourceRef":"resource:aws","targetRef":"resource:gcp","workloadScopeRef":"workload:demo","bindingRef":"binding:receipts",`+
+			`"policy":{"rollbackMode":"REVERSE_REQUIRED","maxQuiesceSeconds":30}}`,
+		append([]string{"Idempotency-Key", "create-1"}, auth...)...), http.StatusCreated)
+	id := created.body["migrationId"].(string)
+
+	waitFor := func(want string, cond func(map[string]any) bool) map[string]any {
 		t.Helper()
 		deadline := time.Now().Add(5 * time.Second)
 		var last map[string]any
 		for time.Now().Before(deadline) {
 			last = get("/v1/migrations/" + id)
-			if last["lifecycle"] == want && last["activeOperationId"] == nil {
+			if last["lifecycle"] == want && last["activeOperationId"] == nil && (cond == nil || cond(last)) {
 				return last
 			}
 			time.Sleep(5 * time.Millisecond)
 		}
-		t.Fatalf("timed out waiting for %s, last lifecycle=%v phase=%v", want, last["lifecycle"], last["phase"])
+		t.Fatalf("timed out waiting for %s, last lifecycle=%v phase=%v allowed=%v", want, last["lifecycle"], last["phase"], last["allowedActions"])
 		return nil
 	}
 	act := func(action, extra string) {
@@ -200,27 +213,30 @@ func TestActionFlowOverHTTP(t *testing.T) {
 		}
 		t.Fatalf("%s did not finish", action)
 	}
+	offers := func(a string) func(map[string]any) bool {
+		return func(s map[string]any) bool { return strings.Contains(fmt.Sprint(s["allowedActions"]), a) }
+	}
 
-	waitLifecycle("READY")
+	// A plan waits: nothing is copied before PREPARE and START_SYNC.
+	time.Sleep(30 * time.Millisecond)
+	waitFor("CREATED", nil)
+	act("PREPARE", "")
+	waitFor("PREPARED", nil)
+	act("START_SYNC", "")
+	waitFor("READY", offers("QUIESCE"))
 	tx := `,"transitionId":"tx-1","quiesceRef":"q-1"`
 	act("QUIESCE", tx)
-	waitLifecycle("QUIESCED")
+	waitFor("QUIESCED", nil)
 	act("CUTOVER", tx)
-	waitLifecycle("SWITCHED")
+	waitFor("SWITCHED", nil)
 	act("RESUME", tx+`,"expectedLocation":"TARGET"`)
-	waitLifecycle("ACTIVE")
-	// FINALIZE is offered once verification passes.
-	deadline := time.Now().Add(5 * time.Second)
-	for fmt.Sprint(get("/v1/migrations/" + id)["allowedActions"]) != "[ROLLBACK FINALIZE]" {
-		if time.Now().After(deadline) {
-			t.Fatal("FINALIZE never offered")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	waitFor("ACTIVE", offers("FINALIZE"))
 	act("FINALIZE", "")
-	final := waitLifecycle("COMPLETED")
-	ops, _ := final["operations"].([]any)
-	if len(ops) != 4 {
+	final := waitFor("COMPLETED", nil)
+	if final["transitionState"] != "CLOSED" {
+		t.Fatalf("transitionState = %v", final["transitionState"])
+	}
+	if ops, _ := final["operations"].([]any); len(ops) != 6 {
 		t.Fatalf("operations = %v", ops)
 	}
 }

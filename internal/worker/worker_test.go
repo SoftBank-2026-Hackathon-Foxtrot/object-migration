@@ -762,3 +762,68 @@ func TestEngineCanAskForTheNextRoundSooner(t *testing.T) {
 	w.Notify(m.ID)
 	waitFor(t, s, m.ID, "several rounds", func(migration.Migration) bool { return e.syncs.Load() >= 5 })
 }
+
+// blockedAccess is a Fake whose preflight fails until fixed.
+type blockedAccess struct {
+	*engine.Fake
+	denied atomic.Bool
+}
+
+func (b *blockedAccess) Preflight(ctx context.Context, src, dst migration.Endpoint) []migration.Check {
+	if b.denied.Load() {
+		return []migration.Check{{Name: "target_write", OK: false, Message: "access denied"}}
+	}
+	return b.Fake.Preflight(ctx, src, dst)
+}
+
+func createPlan(t *testing.T, s store.Store) migration.Migration {
+	t.Helper()
+	m, err := migration.New(
+		migration.Endpoint{Kind: migration.KindS3, Bucket: "src", Region: "ap-northeast-2", Ref: "env:SRC"},
+		migration.Endpoint{Kind: migration.KindGCS, Bucket: "dst", Ref: "env:DST"},
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Plan = &migration.Plan{WorkflowID: "wf", ResourceID: "r"}
+	m, err = s.Create(context.Background(), m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func TestPlanWaitsForPrepareAndStartSync(t *testing.T) {
+	s := store.NewMemory()
+	e := &blockedAccess{Fake: engine.NewFake(time.Millisecond)}
+	e.denied.Store(true)
+	w, _ := start(t, s, e)
+	m := createPlan(t, s)
+	w.Notify(m.ID)
+	time.Sleep(30 * time.Millisecond)
+	if got, _ := s.Get(context.Background(), m.ID); got.Phase != migration.PhaseCreated {
+		t.Fatalf("a plan started on its own: %s", got.Phase)
+	}
+
+	// A failed check fails the operation and leaves the plan to retry.
+	command(t, w, s, m.ID, migration.CommandPrepare)
+	failed := waitFor(t, s, m.ID, "prepare failed", func(m migration.Migration) bool { return m.Pending == nil && m.LastError != nil })
+	op, _ := failed.Operation(m.ID + "-op1")
+	if failed.Phase != migration.PhaseCreated || op.Status != migration.OperationFailed || failed.LastError.Code != "PRECONDITION_FAILED" {
+		t.Fatalf("after failed prepare: phase %s, op %+v, error %+v", failed.Phase, op, failed.LastError)
+	}
+
+	e.denied.Store(false)
+	command(t, w, s, m.ID, migration.CommandPrepare)
+	waitPhase(t, s, m.ID, migration.PhasePrepared)
+	time.Sleep(30 * time.Millisecond)
+	if got, _ := s.Get(context.Background(), m.ID); got.Phase != migration.PhasePrepared {
+		t.Fatalf("copy started before START_SYNC: %s", got.Phase)
+	}
+	command(t, w, s, m.ID, migration.CommandStartSync)
+	ready := waitPhase(t, s, m.ID, migration.PhaseReady)
+	if ready.Replication.InitialCopy.Completed != 10 {
+		t.Fatalf("initial copy = %+v", ready.Replication.InitialCopy)
+	}
+}

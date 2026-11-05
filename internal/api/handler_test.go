@@ -3,14 +3,17 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/routing"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 )
 
@@ -131,7 +134,7 @@ func TestCreateRejectsBadInput(t *testing.T) {
 		"empty body":    ``,
 	} {
 		t.Run(name, func(t *testing.T) {
-			wantError(t, do(t, h, http.MethodPost, "/v1/migrations", body), http.StatusBadRequest, "INVALID_ARGUMENT")
+			wantError(t, do(t, h, http.MethodPost, "/v1/migrations", body), http.StatusBadRequest, "INVALID_REQUEST")
 		})
 	}
 }
@@ -146,9 +149,9 @@ func TestCommandErrors(t *testing.T) {
 	id := decodeBody(t, do(t, h, http.MethodPost, "/v1/migrations", validBody))["id"].(string)
 
 	wantError(t, do(t, h, http.MethodPost, "/v1/migrations/"+id+"/explode", ""), http.StatusNotFound, "NOT_FOUND")
-	wantError(t, do(t, h, http.MethodPost, "/v1/migrations/"+id+"/switch", ""), http.StatusConflict, "INVALID_PHASE")
+	wantError(t, do(t, h, http.MethodPost, "/v1/migrations/"+id+"/switch", ""), http.StatusConflict, "INVALID_STATE")
 	wantError(t, do(t, h, http.MethodPost, "/v1/migrations/om-missing/freeze", ""), http.StatusNotFound, "NOT_FOUND")
-	wantError(t, do(t, h, http.MethodPost, "/v1/migrations/"+id+"/freeze", `{"deadlineMs":-1}`), http.StatusBadRequest, "INVALID_ARGUMENT")
+	wantError(t, do(t, h, http.MethodPost, "/v1/migrations/"+id+"/freeze", `{"deadlineMs":-1}`), http.StatusBadRequest, "INVALID_REQUEST")
 }
 
 func TestAbortAcceptedBeforeSwitch(t *testing.T) {
@@ -181,7 +184,7 @@ func TestIdempotentCreateReplays(t *testing.T) {
 		t.Fatalf("created %d migrations, want 1", len(n.ids))
 	}
 	other := `{"source":{"kind":"s3","bucket":"other","region":"ap-northeast-1","ref":"env:SRC"},"target":{"kind":"gcs","bucket":"dst","ref":"env:DST"}}`
-	wantError(t, do(t, h, http.MethodPost, "/v1/migrations", other, idempotencyHeader, "create-1"), http.StatusUnprocessableEntity, "IDEMPOTENCY_KEY_REUSED")
+	wantError(t, do(t, h, http.MethodPost, "/v1/migrations", other, idempotencyHeader, "create-1"), http.StatusConflict, "IDEMPOTENCY_CONFLICT")
 }
 
 func TestCapabilities(t *testing.T) {
@@ -246,9 +249,9 @@ func TestRetryableErrorIsNotReplayed(t *testing.T) {
 		t.Fatalf("freeze: %d %s", rec.Code, rec.Body)
 	}
 	busy := do(t, h, http.MethodDelete, "/v1/migrations/"+id, "", idempotencyHeader, "abort-1")
-	wantError(t, busy, http.StatusConflict, "COMMAND_PENDING")
+	wantError(t, busy, http.StatusConflict, "RESOURCE_BUSY")
 	if decodeBody(t, busy)["retryable"] != true {
-		t.Fatal("COMMAND_PENDING should be retryable")
+		t.Fatal("RESOURCE_BUSY should be retryable")
 	}
 
 	// The worker clears the pending command; the same retry now succeeds.
@@ -263,10 +266,10 @@ func TestNonRetryableErrorIsReplayed(t *testing.T) {
 	h, _ := newTestHandler()
 	id := decodeBody(t, do(t, h, http.MethodPost, "/v1/migrations", validBody))["id"].(string)
 	first := do(t, h, http.MethodPost, "/v1/migrations/"+id+"/switch", "", idempotencyHeader, "switch-1")
-	wantError(t, first, http.StatusConflict, "INVALID_PHASE")
+	wantError(t, first, http.StatusConflict, "INVALID_STATE")
 	again := do(t, h, http.MethodPost, "/v1/migrations/"+id+"/switch", "", idempotencyHeader, "switch-1")
 	if again.Header().Get("Idempotent-Replayed") != "true" || again.Body.String() != first.Body.String() {
-		t.Fatalf("INVALID_PHASE was not replayed: %s", again.Body)
+		t.Fatalf("INVALID_STATE was not replayed: %s", again.Body)
 	}
 }
 
@@ -277,7 +280,7 @@ func TestFinalizeBeforeVerificationIsPreconditionFailed(t *testing.T) {
 		m.Phase, m.State = migration.PhaseVerifying, migration.StateRunning
 	})
 	rec := do(t, h, http.MethodPost, "/v1/migrations/"+id+"/finalize", "")
-	wantError(t, rec, http.StatusConflict, "PRECONDITION_FAILED")
+	wantError(t, rec, http.StatusUnprocessableEntity, "PRECONDITION_FAILED")
 }
 
 func TestConcurrentRequestsWithSameKeyCreateOnce(t *testing.T) {
@@ -325,7 +328,7 @@ func TestStatusShowsAllowedActionsAndReplication(t *testing.T) {
 	body := decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))
 	allowed, _ := json.Marshal(body["allowedActions"])
 	cmds, _ := json.Marshal(body["allowedCommands"])
-	if string(allowed) != `["QUIESCE","CANCEL"]` || string(cmds) != `["freeze","abort"]` {
+	if string(allowed) != `["QUIESCE","CANCEL","RECONCILE"]` || string(cmds) != `["freeze","abort"]` {
 		t.Fatalf("allowedActions = %s, allowedCommands = %s", allowed, cmds)
 	}
 	if body["lifecycle"] != "READY" || body["health"] != "OK" || body["kind"] != "OBJECT_STORAGE" {
@@ -352,8 +355,8 @@ func TestStaleExpectedVersionIsConflict(t *testing.T) {
 	current := int(decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))["version"].(float64))
 
 	stale := `{"expectedVersion":` + strconv.Itoa(current-1) + `}`
-	wantError(t, do(t, h, http.MethodPost, "/v1/migrations/"+id+"/freeze", stale), http.StatusConflict, "VERSION_CONFLICT")
-	wantError(t, do(t, h, http.MethodDelete, "/v1/migrations/"+id, stale), http.StatusConflict, "VERSION_CONFLICT")
+	wantError(t, do(t, h, http.MethodPost, "/v1/migrations/"+id+"/freeze", stale), http.StatusConflict, "REVISION_CONFLICT")
+	wantError(t, do(t, h, http.MethodDelete, "/v1/migrations/"+id, stale), http.StatusConflict, "REVISION_CONFLICT")
 
 	ok := `{"expectedVersion":` + strconv.Itoa(current) + `}`
 	if rec := do(t, h, http.MethodPost, "/v1/migrations/"+id+"/freeze", ok); rec.Code != http.StatusAccepted {
@@ -361,29 +364,89 @@ func TestStaleExpectedVersionIsConflict(t *testing.T) {
 	}
 }
 
+// planBody is a common-API create request for the buckets in testResources.
+const planBody = `{"workflowId":"wf-1","resourceId":"receipts","kind":"OBJECT_STORAGE","profile":"object-copy-route-v1",` +
+	`"sourceRef":"resource:aws","targetRef":"resource:gcp","workloadScopeRef":"workload:demo","bindingRef":"binding:receipts",` +
+	`"policy":{"rollbackMode":"REVERSE_REQUIRED","maxQuiesceSeconds":30}}`
+
+var testResources = map[string]migration.Endpoint{
+	"aws": {Kind: migration.KindS3, Bucket: "src", Region: "ap-northeast-2", Ref: "env:SRC"},
+	"gcp": {Kind: migration.KindGCS, Bucket: "dst", Ref: "env:DST"},
+}
+
+func newPlanHandler() (http.Handler, *store.Memory) {
+	st := store.NewMemory()
+	return NewHandler(Deps{Store: st, Engine: "fake", Resources: testResources}), st
+}
+
+func TestCreatePlanChecksTheContract(t *testing.T) {
+	h, _ := newPlanHandler()
+	wantError(t, do(t, h, http.MethodPost, "/v1/migrations", planBody), http.StatusBadRequest, "INVALID_REQUEST") // no key
+	for _, c := range []struct{ from, to, code string }{
+		{`"profile":"object-copy-route-v1"`, `"profile":"other"`, "UNSUPPORTED_PROFILE"},
+		{`"REVERSE_REQUIRED"`, `"BEFORE_TARGET_WRITE"`, "UNSUPPORTED_PROFILE"},
+		{`"kind":"OBJECT_STORAGE"`, `"kind":"DATABASE"`, "UNSUPPORTED_PROFILE"},
+		{`"resource:gcp"`, `"resource:nope"`, "PRECONDITION_FAILED"},
+		{`"resource:gcp"`, `"resource:aws"`, "PRECONDITION_FAILED"},
+	} {
+		body := strings.Replace(planBody, c.from, c.to, 1)
+		wantError(t, do(t, h, http.MethodPost, "/v1/migrations", body, idempotencyHeader, c.to), http.StatusUnprocessableEntity, c.code)
+	}
+	wantError(t, do(t, h, http.MethodPost, "/v1/migrations", strings.Replace(planBody, `"bindingRef":"binding:receipts",`, "", 1), idempotencyHeader, "k"),
+		http.StatusBadRequest, "INVALID_REQUEST")
+
+	rec := do(t, h, http.MethodPost, "/v1/migrations", planBody, idempotencyHeader, "create-plan")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body)
+	}
+	body := decodeBody(t, rec)
+	for k, want := range map[string]any{
+		"lifecycle": "CREATED", "workflowId": "wf-1", "resourceId": "receipts", "kind": "OBJECT_STORAGE",
+		"transitionState": "NONE", "transitionId": nil, "activeOperationId": nil, "health": "OK",
+	} {
+		if body[k] != want {
+			t.Errorf("%s = %v, want %v", k, body[k], want)
+		}
+	}
+	if fmt.Sprint(body["allowedActions"]) != "[PREPARE CANCEL RECONCILE]" {
+		t.Errorf("allowedActions = %v", body["allowedActions"])
+	}
+	if rec.Header().Get("Location") != "/v1/migrations/"+body["migrationId"].(string) {
+		t.Errorf("Location = %q", rec.Header().Get("Location"))
+	}
+	checks, _ := body["checks"].([]any)
+	if len(checks) != 10 {
+		t.Errorf("%d checks", len(checks))
+	}
+}
+
 func TestActionsCheckTheirFields(t *testing.T) {
-	h, _, st := newTestHandlerWithStore()
-	id := decodeBody(t, do(t, h, http.MethodPost, "/v1/migrations", validBody))["id"].(string)
+	h, st := newPlanHandler()
+	id := decodeBody(t, do(t, h, http.MethodPost, "/v1/migrations", planBody, idempotencyHeader, "c"))["migrationId"].(string)
 	setState(t, st, id, func(m *migration.Migration) { m.Phase = migration.PhaseReady })
 	rev := strconv.Itoa(int(decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))["revision"].(float64)))
 	path := "/v1/migrations/" + id + "/actions"
-
-	for _, c := range []struct{ body, code string }{
-		{`{"action":"START_SYNC","expectedRevision":` + rev + `}`, "UNSUPPORTED_ACTION"},
-		{`{"action":"RECONCILE","expectedRevision":` + rev + `}`, "UNSUPPORTED_ACTION"},
-		{`{"action":"JUMP","expectedRevision":` + rev + `}`, "INVALID_ARGUMENT"},
-		{`{"action":"QUIESCE","transitionId":"tx-1"}`, "INVALID_ARGUMENT"},
-		{`{"action":"QUIESCE","expectedRevision":` + rev + `}`, "INVALID_ARGUMENT"},
-		{`{"action":"RESUME","expectedRevision":` + rev + `,"transitionId":"tx-1","expectedLocation":"SOURCE"}`, "INVALID_ARGUMENT"},
-	} {
-		wantError(t, do(t, h, http.MethodPost, path, c.body), http.StatusBadRequest, c.code)
+	post := func(key, body string) *httptest.ResponseRecorder {
+		return do(t, h, http.MethodPost, path, body, idempotencyHeader, key)
 	}
-	wantError(t, do(t, h, http.MethodPost, path, `{"action":"QUIESCE","expectedRevision":999,"transitionId":"tx-1"}`), http.StatusConflict, "VERSION_CONFLICT")
-	wantError(t, do(t, h, http.MethodPost, path, `{"action":"CUTOVER","expectedRevision":`+rev+`,"transitionId":"tx-1"}`), http.StatusConflict, "INVALID_PHASE")
+
+	wantError(t, do(t, h, http.MethodPost, path, `{"action":"QUIESCE","expectedRevision":`+rev+`,"transitionId":"tx-1","quiesceRef":"q"}`), http.StatusBadRequest, "INVALID_REQUEST")
+	for i, body := range []string{
+		`{"action":"JUMP","expectedRevision":` + rev + `}`,
+		`{"action":"QUIESCE","transitionId":"tx-1","quiesceRef":"q"}`,
+		`{"action":"QUIESCE","expectedRevision":` + rev + `,"transitionId":"tx-1"}`,
+		`{"action":"CANCEL","expectedRevision":` + rev + `,"transitionId":"tx-1"}`,
+		`{"action":"RESUME","expectedRevision":` + rev + `,"transitionId":"tx-1","quiesceRef":"q"}`,
+		`{"action":"QUIESCE","expectedRevision":` + rev + `,"transitionId":"tx-1","quiesceRef":"q","expectedLocation":"TARGET"}`,
+	} {
+		wantError(t, post(fmt.Sprint("bad-", i), body), http.StatusBadRequest, "INVALID_REQUEST")
+	}
+	wantError(t, post("stale", `{"action":"QUIESCE","expectedRevision":999,"transitionId":"tx-1","quiesceRef":"q"}`), http.StatusConflict, "REVISION_CONFLICT")
+	wantError(t, post("early", `{"action":"CUTOVER","expectedRevision":`+rev+`,"transitionId":"tx-1","quiesceRef":"q"}`), http.StatusConflict, "INVALID_STATE")
 
 	// Progress updates change the version but not the revision.
 	setState(t, st, id, func(m *migration.Migration) { m.Replication.Forward.Backlog = 3 })
-	rec := do(t, h, http.MethodPost, path, `{"action":"QUIESCE","expectedRevision":`+rev+`,"transitionId":"tx-1","quiesceRef":"q-1"}`)
+	rec := post("q-1", `{"action":"QUIESCE","expectedRevision":`+rev+`,"transitionId":"tx-1","quiesceRef":"q-1"}`)
 	if rec.Code != http.StatusAccepted {
 		t.Fatalf("quiesce: %d %s", rec.Code, rec.Body)
 	}
@@ -393,11 +456,110 @@ func TestActionsCheckTheirFields(t *testing.T) {
 		t.Fatalf("accepted = %v, Location %q", body, rec.Header().Get("Location"))
 	}
 	op := decodeBody(t, do(t, h, http.MethodGet, "/v1/operations/"+opID, ""))
-	if op["status"] != "RUNNING" || op["action"] != "QUIESCE" || op["transitionId"] != "tx-1" || op["quiesceRef"] != "q-1" || op["migrationId"] != id {
+	if op["status"] != "RUNNING" || op["action"] != "QUIESCE" || op["transitionId"] != "tx-1" || op["migrationId"] != id || op["error"] != nil {
 		t.Fatalf("operation = %v", op)
 	}
+	status := decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))
+	if status["transitionId"] != "tx-1" || status["transitionState"] != "OPEN" || fmt.Sprint(status["allowedActions"]) != "[RECONCILE]" {
+		t.Fatalf("while quiescing: transition %v %v, allowed %v", status["transitionId"], status["transitionState"], status["allowedActions"])
+	}
+	rev = strconv.Itoa(int(status["revision"].(float64)))
+	wantError(t, post("busy", `{"action":"CANCEL","expectedRevision":`+rev+`}`), http.StatusConflict, "RESOURCE_BUSY")
+
+	// The worker finishes the freeze; another transition is refused.
+	setState(t, st, id, func(m *migration.Migration) {
+		m.Pending = nil
+		if err := m.TransitionTo(migration.PhaseFrozen, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	rev = strconv.Itoa(int(decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))["revision"].(float64)))
+	wantError(t, post("other-tx", `{"action":"CUTOVER","expectedRevision":`+rev+`,"transitionId":"tx-2","quiesceRef":"q"}`), http.StatusConflict, "INVALID_STATE")
 	wantError(t, do(t, h, http.MethodGet, "/v1/operations/"+id+"-op9", ""), http.StatusNotFound, "NOT_FOUND")
 	wantError(t, do(t, h, http.MethodGet, "/v1/operations/nope", ""), http.StatusNotFound, "NOT_FOUND")
+}
+
+func TestUnknownOutcomeNeedsReconcile(t *testing.T) {
+	apps := routing.NewApps(time.Minute)
+	st := store.NewMemory()
+	h := NewHandler(Deps{Store: st, Engine: "fake", Resources: testResources, Apps: apps})
+	id := decodeBody(t, do(t, h, http.MethodPost, "/v1/migrations", planBody, idempotencyHeader, "c"))["migrationId"].(string)
+	// A switch whose apps did not confirm the new route.
+	setState(t, st, id, func(m *migration.Migration) {
+		m.Phase = migration.PhaseFrozen
+		m.TransitionID = "tx-1"
+		if err := m.RequestCommand(migration.CommandRequest{Command: migration.CommandSwitch, CutoverID: "tx-1"}); err != nil {
+			t.Fatal(err)
+		}
+		m.SetRoute(migration.RouteBoth)
+		m.State = migration.StateUnknown
+	})
+	apps.Report(id, "app-1", 1)
+	status := decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))
+	if status["health"] != "UNKNOWN" || fmt.Sprint(status["allowedActions"]) != "[RECONCILE]" {
+		t.Fatalf("health %v, allowed %v", status["health"], status["allowedActions"])
+	}
+	rev := strconv.Itoa(int(status["revision"].(float64)))
+	path := "/v1/migrations/" + id + "/actions"
+	wantError(t, do(t, h, http.MethodPost, path, `{"action":"ROLLBACK","expectedRevision":`+rev+`,"transitionId":"tx-1","quiesceRef":"q"}`, idempotencyHeader, "rb-early"),
+		http.StatusConflict, "RESOURCE_BUSY")
+
+	rec := do(t, h, http.MethodPost, path, `{"action":"RECONCILE","expectedRevision":`+rev+`}`, idempotencyHeader, "rec-1")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("reconcile: %d %s", rec.Code, rec.Body)
+	}
+	op := decodeBody(t, do(t, h, http.MethodGet, rec.Header().Get("Location"), ""))
+	changes := fmt.Sprint(op["confirmedChanges"])
+	if op["status"] != "SUCCEEDED" || !strings.Contains(changes, "apps not on generation 2: app-1") {
+		t.Fatalf("reconcile operation = %v", op)
+	}
+	status = decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))
+	if status["health"] != "FAILED" || fmt.Sprint(status["allowedActions"]) != "[ROLLBACK RECONCILE]" {
+		t.Fatalf("after reconcile: health %v, allowed %v", status["health"], status["allowedActions"])
+	}
+	rev = strconv.Itoa(int(status["revision"].(float64)))
+	rec = do(t, h, http.MethodPost, path, `{"action":"ROLLBACK","expectedRevision":`+rev+`,"transitionId":"tx-1","quiesceRef":"q"}`, idempotencyHeader, "rb")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("rollback after reconcile: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestRollbackIsHeldUntilResumeSource(t *testing.T) {
+	h, st := newPlanHandler()
+	id := decodeBody(t, do(t, h, http.MethodPost, "/v1/migrations", planBody, idempotencyHeader, "c"))["migrationId"].(string)
+	setState(t, st, id, func(m *migration.Migration) {
+		m.Phase = migration.PhaseRolledBack
+		m.TransitionID = "tx-1"
+		m.TargetWritesPossible = true
+	})
+	status := decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))
+	if status["lifecycle"] != "ROLLED_BACK_HELD" || fmt.Sprint(status["allowedActions"]) != "[RESUME RECONCILE]" {
+		t.Fatalf("lifecycle %v, allowed %v", status["lifecycle"], status["allowedActions"])
+	}
+	path := "/v1/migrations/" + id + "/actions"
+	act := func(key, body string) map[string]any {
+		t.Helper()
+		rev := strconv.Itoa(int(decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))["revision"].(float64)))
+		rec := do(t, h, http.MethodPost, path, strings.Replace(body, "REV", rev, 1), idempotencyHeader, key)
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("%s: %d %s", key, rec.Code, rec.Body)
+		}
+		return decodeBody(t, rec)
+	}
+	rev := strconv.Itoa(int(status["revision"].(float64)))
+	wantError(t, do(t, h, http.MethodPost, path, `{"action":"RESUME","expectedRevision":`+rev+`,"transitionId":"tx-1","quiesceRef":"q","expectedLocation":"TARGET"}`, idempotencyHeader, "wrong"),
+		http.StatusConflict, "INVALID_STATE")
+	if r := act("resume", `{"action":"RESUME","expectedRevision":REV,"transitionId":"tx-1","quiesceRef":"q","expectedLocation":"SOURCE"}`); r["status"] != "SUCCEEDED" {
+		t.Fatalf("resume source = %v", r)
+	}
+	status = decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))
+	if status["lifecycle"] != "RESTORED" || status["transitionState"] != "CLOSED" {
+		t.Fatalf("after resume: %v %v", status["lifecycle"], status["transitionState"])
+	}
+	act("finalize", `{"action":"FINALIZE","expectedRevision":REV}`)
+	if lc := decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))["lifecycle"]; lc != "COMPLETED" {
+		t.Fatalf("after finalize: %v", lc)
+	}
 }
 
 func TestTokenGuardsControlRoutesOnly(t *testing.T) {

@@ -1,34 +1,37 @@
 openapi: 3.1.0
 info:
-  title: Migration server common API
-  version: 0.2.0
+  title: Object storage migration server
+  version: 0.3.0
   description: |
-    Object storage server of the team's common migration API. It follows
-    common draft 0.2 where object storage fits: POST
-    /v1/migrations/{id}/actions with QUIESCE, CUTOVER, RESUME, ROLLBACK,
-    FINALIZE and CANCEL; GET /v1/operations/{id}; Bearer tokens;
-    Idempotency-Key; expectedRevision; and the common lifecycle and health
-    values. PREPARE, START_SYNC and RECONCILE are rejected with
-    UNSUPPORTED_ACTION: POST /v1/migrations starts the initial copy at once,
-    and the worker re-reads buckets and app routes after every restart.
+    The object storage server of the team's common migration API (draft 0.2,
+    the contract the DB and Redis servers share). An orchestrator registers
+    a plan with POST /v1/migrations, sends the nine actions to
+    POST /v1/migrations/{id}/actions, and follows each one at
+    GET /v1/operations/{id}. Every POST to these routes needs an
+    Idempotency-Key.
 
-    The server answers 202 at once and does the work in the background.
-    Poll the operation's Location, or GET /v1/migrations/{id}.
+    How object storage fills the common steps:
+    - PREPARE checks access and that the target is clean, then starts
+      following the source's changes. START_SYNC starts the full copy.
+    - QUIESCE only records the cutover attempt: apps keep writing.
+    - CUTOVER moves app reads to both buckets, then writes to the target,
+      waiting for every app to take each new route.
+    - RESUME TARGET starts copying the target's changes back to the source.
+    - ROLLBACK copies the target's new objects back and moves apps to the
+      source; RESUME SOURCE then confirms them there (no other change).
+    - RECONCILE compares the record with what apps report and changes
+      nothing outside the record.
+    - FINALIZE stops reading and deleting from the source.
 
-    When the server runs with API_TOKEN set, every route except /healthz,
-    .../routing and .../deletes needs Authorization: Bearer <token>. Apps
-    call those two with no token.
+    With API_TOKEN set, every route except /healthz, .../routing and
+    .../deletes needs Authorization: Bearer <token>. Apps call those two
+    with no token.
 
-    The older path commands (POST /v1/migrations/{id}/freeze and the rest)
-    still work for existing tools.
-
-    Cutover is split into freeze, switch, and resume so the orchestrator can
-    line several servers up. Each server decides what each command means for
-    its resource; for object storage, freeze does nothing.
-
-    Field names in `phase`, `state`, `readiness`, `replication`,
-    `allowedActions`, and error bodies are shared. `detail`, `source`,
-    `target`, and `replication.initialCopy.unit` are server-specific.
+    Responses carry the common fields and, after them, this server's own
+    (phase, state, source, target, replication, routing, version,
+    operations). The older routes — inline endpoints on POST
+    /v1/migrations, which start at once, and the path commands — still
+    work for existing tools.
 
 paths:
   /healthz:
@@ -83,24 +86,42 @@ paths:
 
   /v1/migrations:
     post:
-      summary: Create a migration and start the initial sync
+      summary: Register a plan, or create and start a migration
+      description: |
+        A body with workflowId is a common-API plan: it names registered
+        buckets (sourceRef, targetRef as "resource:<name>", from the file in
+        OBJECT_RESOURCES), touches nothing, and answers 201 in CREATED. It
+        needs an Idempotency-Key.
+
+        A body with inline source and target endpoints creates a migration
+        that starts at once and answers 202. Kept for existing tools.
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
           application/json:
-            schema: { $ref: "#/components/schemas/EndpointsRequest" }
+            schema:
+              oneOf:
+                - { $ref: "#/components/schemas/CreatePlan" }
+                - { $ref: "#/components/schemas/EndpointsRequest" }
       responses:
-        "202":
-          description: Created; the worker starts the initial sync
+        "201":
+          description: Plan registered, in CREATED
           headers:
             Location:
               schema: { type: string, example: /v1/migrations/om-1a2b3c4d5e6f7a8b }
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Migration" }
+        "202":
+          description: Created from inline endpoints; the worker starts the initial copy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Migration" }
         "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
         "422": { $ref: "#/components/responses/Error" }
 
   /v1/migrations/{id}:
@@ -209,51 +230,24 @@ paths:
     post:
       summary: Accept a common-API action
       description: |
-        QUIESCE (READY) records the cutover attempt; object storage needs no
-        pause, so apps keep writing. CUTOVER (QUIESCED) moves app reads to
-        both buckets, then writes to the target, waiting for every app.
-        RESUME (SWITCHED) stops forward copying and starts copying the
-        target back. ROLLBACK (QUIESCED, SWITCHED, ACTIVE while
-        readiness.rollback is PASS) moves apps back to the source, which
-        ends in RESTORED with no RESUME. FINALIZE (ACTIVE while
-        readiness.advance is PASS) stops reading and deleting from the
-        source. CANCEL works before CUTOVER.
+        The action must be in allowedActions and expectedRevision must equal
+        the migration's revision. One command runs at a time. After an
+        unknown outcome (health UNKNOWN) only RECONCILE is accepted until it
+        has run. A migration allows one cutover attempt: the first QUIESCE
+        sets transitionId and later held actions must repeat it.
+
+        RECONCILE, RESUME SOURCE and FINALIZE of a restored plan finish when
+        accepted (status SUCCEEDED); the others run in the worker.
       parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/IdempotencyKeyRequired"
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [action, expectedRevision]
-              additionalProperties: false
-              properties:
-                action:
-                  type: string
-                  enum: [QUIESCE, CUTOVER, RESUME, ROLLBACK, FINALIZE, CANCEL]
-                expectedRevision:
-                  type: integer
-                  minimum: 1
-                  description: Must equal the migration's revision, or 409 VERSION_CONFLICT.
-                transitionId:
-                  type: string
-                  description: Required for QUIESCE, CUTOVER, RESUME and ROLLBACK.
-                quiesceRef:
-                  type: string
-                  description: Kept on the operation for tracing; object storage does not check it.
-                expectedLocation:
-                  type: string
-                  enum: [TARGET]
-                  description: Required for RESUME. Only the target is resumed.
-                deadlineMs:
-                  type: integer
-                  minimum: 0
-                  maximum: 3600000
-                  description: How long CUTOVER, FINALIZE or CANCEL waits for apps. Default 30000.
+            schema: { $ref: "#/components/schemas/ActionRequest" }
       responses:
         "202":
-          description: Accepted, not finished. Follow Location.
+          description: Accepted, not necessarily finished. Follow Location.
           headers:
             Location:
               schema: { type: string, example: /v1/operations/om-1a2b3c4d5e6f7a8b-op1 }
@@ -263,18 +257,21 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [operationId, migrationId, action, status, statusUrl, revision]
+                required: [operationId, migrationId, action, status, statusUrl]
                 properties:
                   operationId: { type: string }
                   migrationId: { type: string }
-                  action: { type: string }
-                  status: { type: string, enum: [QUEUED] }
+                  action: { $ref: "#/components/schemas/Action" }
+                  status: { $ref: "#/components/schemas/OperationStatus" }
                   statusUrl: { type: string }
-                  revision: { type: integer }
         "400": { $ref: "#/components/responses/Error" }
         "401": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
-        "409": { $ref: "#/components/responses/Error" }
+        "409":
+          description: REVISION_CONFLICT, RESOURCE_BUSY, INVALID_STATE, UNKNOWN_STATE or IDEMPOTENCY_CONFLICT
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
         "422": { $ref: "#/components/responses/Error" }
 
   /v1/operations/{operationId}:
@@ -288,10 +285,11 @@ paths:
       responses:
         "200":
           description: |
-            RUNNING until the migration reaches the action's phase (ROLLBACK
-            runs on through ROLLING_BACK). UNKNOWN when the worker could not
-            confirm the outcome, for example apps that did not take a new
-            route before the deadline: send ROLLBACK or wait.
+            RUNNING until the migration reaches the action's result (ROLLBACK
+            runs on until apps are back on the source). UNKNOWN while apps
+            have not confirmed a new route before the deadline: RECONCILE,
+            then ROLLBACK or wait. FAILED does not mean anything was undone;
+            confirmedChanges lists the route the operation left.
           headers:
             Retry-After:
               description: Sent while the operation is still running.
@@ -300,24 +298,22 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [operationId, migrationId, action, status, lifecycle, revision, requestedAt]
+                required: [operationId, migrationId, action, status, error, confirmedChanges]
                 properties:
                   operationId: { type: string }
                   migrationId: { type: string }
-                  action: { type: string }
-                  command: { type: string }
-                  transitionId: { type: string }
-                  quiesceRef: { type: string }
-                  status: { type: string, enum: [RUNNING, SUCCEEDED, FAILED, UNKNOWN] }
-                  message: { type: string }
-                  lifecycle: { type: string }
-                  revision: { type: integer }
-                  requestedAt: { type: string, format: date-time }
-                  finishedAt: { type: string, format: date-time }
-                  lastError:
+                  action: { $ref: "#/components/schemas/Action" }
+                  status: { $ref: "#/components/schemas/OperationStatus" }
+                  error:
                     oneOf:
                       - type: "null"
                       - { $ref: "#/components/schemas/Error" }
+                  confirmedChanges: { type: array, items: { type: string } }
+                  transitionId: { type: [string, "null"] }
+                  requestedAt: { type: string, format: date-time }
+                  finishedAt: { type: [string, "null"], format: date-time }
+                  lifecycle: { $ref: "#/components/schemas/Lifecycle" }
+                  revision: { type: integer }
         "401": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
 
@@ -365,7 +361,13 @@ components:
       description: |
         Repeating a request with the same key returns the first response,
         marked with the header Idempotent-Replayed: true. Reusing a key for a
-        different request returns 422 IDEMPOTENCY_KEY_REUSED.
+        different request returns 409 IDEMPOTENCY_CONFLICT.
+      schema: { type: string }
+    IdempotencyKeyRequired:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: As IdempotencyKey; required.
       schema: { type: string }
 
   responses:
@@ -457,6 +459,7 @@ components:
       type: string
       enum:
         - CREATED
+        - PREPARED
         - INITIAL_SYNC
         - SYNCING
         - READY
@@ -509,22 +512,83 @@ components:
 
     Migration:
       type: object
-      required: [id, type, kind, lifecycle, health, phase, state, source, target, replication, readiness, lastError, version, revision, createdAt, updatedAt, allowedActions, allowedCommands]
+      description: |
+        The common status first, then this server's own fields. readiness
+        and checks follow the common form; details.object.readiness keeps
+        every check behind them.
+      required: [migrationId, workflowId, resourceId, kind, revision, lifecycle, health, phase, activeOperationId, transitionId, transitionState, topologyRevision, allowedActions, observed, readiness, rollback, progress, checks]
       properties:
-        id: { type: string }
-        type: { type: string, enum: [object, db, cache] }
+        migrationId: { type: string }
+        workflowId: { type: string, description: Empty for migrations created from inline endpoints. }
+        resourceId: { type: string }
         kind: { type: string, enum: [OBJECT_STORAGE] }
-        lifecycle:
-          type: string
-          enum: [CREATED, SYNCING, READY, QUIESCED, SWITCHED, ACTIVE, COMPLETED, ROLLING_BACK, RESTORED, CANCELLED, FAILED]
-          description: |
-            Common lifecycle. INITIAL_SYNC and SYNCING are SYNCING, FROZEN is
-            QUIESCED, RESUMED and VERIFYING are ACTIVE, ROLLED_BACK is
-            RESTORED, ABORTED is CANCELLED. ROLLING_BACK is object storage's own.
+        revision: { type: integer, description: Changes when the phase changes or an action is accepted, not on progress. }
+        lifecycle: { $ref: "#/components/schemas/Lifecycle" }
         health: { type: string, enum: [OK, FAILED, UNKNOWN] }
         phase: { $ref: "#/components/schemas/Phase" }
+        activeOperationId: { type: [string, "null"] }
+        transitionId: { type: [string, "null"] }
+        transitionState: { type: string, enum: [NONE, OPEN, CLOSED] }
+        topologyRevision: { type: integer, description: The route generation apps follow. }
+        allowedActions:
+          type: array
+          items: { $ref: "#/components/schemas/Action" }
+        observed:
+          type: object
+          required: [observedAt, route, businessWriteAccess, targetWritesPossible]
+          properties:
+            observedAt: { type: string, format: date-time }
+            route: { type: string, enum: [SOURCE, TARGET, MIXED], description: MIXED while apps read both buckets. }
+            businessWriteAccess: { type: string, enum: [SOURCE_ONLY, TARGET_ONLY] }
+            targetWritesPossible: { type: boolean, description: True from the moment CUTOVER is accepted, and never false again. }
+        readiness:
+          type: object
+          required: [cutover, resume, rollback, advance]
+          properties:
+            cutover: { $ref: "#/components/schemas/CommonDecision" }
+            resume: { $ref: "#/components/schemas/CommonDecision" }
+            rollback: { $ref: "#/components/schemas/CommonDecision" }
+            advance:
+              allOf: [{ $ref: "#/components/schemas/CommonDecision" }]
+              description: "FAIL when an ADVANCE check fails, else UNKNOWN: WORKLOAD_RUNNING and BUSINESS_PROBE are the orchestrator's evidence."
+        rollback:
+          type: object
+          required: [method, reasons]
+          properties:
+            method: { type: string, enum: [DIRECT, REVERSE_SYNC, UNAVAILABLE] }
+            reasons: { type: array, items: { type: string } }
+        progress:
+          type: object
+          required: [completed, total, unit]
+          properties:
+            completed: { type: [integer, "null"] }
+            total: { type: [integer, "null"] }
+            unit: { type: string, enum: [objects] }
+        checks:
+          type: array
+          description: |
+            QUIESCE_COMPLETE, CUTOVER_SAFE, RESUME_SAFE, ROLLBACK_SAFE, and the
+            ADVANCE checks RESOURCE_HEALTH, ROUTE_MATCH, WORKLOAD_RUNNING,
+            BUSINESS_PROBE, FOLLOWUP_COMPLETE (target matches source while
+            copying back) and STABILITY_WINDOW (30 seconds on the target).
+          items: { $ref: "#/components/schemas/CommonCheck" }
+        details:
+          type: object
+          properties:
+            object:
+              type: object
+              properties:
+                readiness:
+                  type: object
+                  properties:
+                    cutover: { $ref: "#/components/schemas/Decision" }
+                    advance: { $ref: "#/components/schemas/Decision" }
+                    rollback: { $ref: "#/components/schemas/Decision" }
+                appsLive: { type: integer, description: Apps that asked for their route within APP_TTL. }
+        id: { type: string, description: Same as migrationId. }
+        type: { type: string, enum: [object] }
         state: { $ref: "#/components/schemas/State" }
-        detail: { type: string, description: Server-specific sub-step for dashboards. }
+        detail: { type: string }
         source: { $ref: "#/components/schemas/Endpoint" }
         target: { $ref: "#/components/schemas/Endpoint" }
         routing:
@@ -537,13 +601,9 @@ components:
             delete: { type: array, items: { type: string, enum: [source, target] } }
         replication:
           type: object
-          required: [forward, reverse, initialCopy]
           description: >-
             How data is moving now. Forward is source to target; reverse is
-            target to source after the switch. For a flow that follows a
-            change feed, backlog is about how many changes wait in the feed
-            and lagSeconds is the p95 time from a change in one bucket to
-            the other over the last round.
+            target to source after resume.
           properties:
             forward: { $ref: "#/components/schemas/Flow" }
             reverse: { $ref: "#/components/schemas/Flow" }
@@ -553,62 +613,128 @@ components:
                 completed: { type: integer }
                 total: { type: integer }
                 unit: { type: string }
-                bytes:
-                  type: integer
-                  description: Progress by size, when known.
+                bytes: { type: integer }
                 totalBytes: { type: integer }
-        readiness:
-          type: object
-          required: [cutover, advance, rollback]
-          properties:
-            cutover:
-              allOf: [{ $ref: "#/components/schemas/Decision" }]
-              description: Can freeze start? Judged while syncing.
-            advance:
-              allOf: [{ $ref: "#/components/schemas/Decision" }]
-              description: After resume, does the target match the source so the migration can finalize?
-            rollback:
-              allOf: [{ $ref: "#/components/schemas/Decision" }]
-              description: Can the migration go back to the source now?
-        allowedActions:
-          type: array
-          description: Actions POST .../actions would accept now. Still checked again when sent.
-          items: { type: string, enum: [QUIESCE, CUTOVER, RESUME, ROLLBACK, FINALIZE, CANCEL] }
         allowedCommands:
           type: array
-          description: The same, as path commands.
-          items: { type: string, enum: [freeze, switch, resume, rollback, finalize, abort] }
-        activeOperationId: { type: string, description: The operation still running, if any. }
+          description: allowedActions as path commands.
+          items: { type: string, enum: [prepare, start_sync, freeze, switch, resume, rollback, finalize, abort] }
         operations:
           type: array
-          description: Every accepted command, oldest first.
+          description: Every accepted action, oldest first.
           items: { type: object }
-        pendingCommand:
-          type: object
-          properties:
-            command: { type: string, enum: [freeze, switch, resume, rollback, finalize, abort] }
-            idempotencyKey: { type: string }
-            cutoverId: { type: string }
-            deadlineMs: { type: integer }
-            expectedVersion: { type: integer }
-            requestedAt: { type: string, format: date-time }
+        plan: { type: object, description: The common-API create request, when there was one. }
         lastError:
           oneOf:
             - type: "null"
-            - { $ref: "#/components/schemas/Error" }
+            - { $ref: "#/components/schemas/ServerError" }
         version: { type: integer, description: Changes on every write, progress included. }
-        revision: { type: integer, description: Changes only when the phase changes or a command is accepted. }
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
 
-    Capabilities:
+    Lifecycle:
+      type: string
+      enum: [CREATED, PREPARED, SYNCING, READY, QUIESCED, SWITCHED, ACTIVE, ROLLED_BACK_HELD, RESTORED, CANCELLED, COMPLETED, FAILED]
+      description: While a rollback runs, the lifecycle stays where it started, with activeOperationId set.
+
+    Action:
+      type: string
+      enum: [PREPARE, START_SYNC, QUIESCE, CUTOVER, RESUME, ROLLBACK, CANCEL, RECONCILE, FINALIZE]
+
+    OperationStatus:
+      type: string
+      enum: [QUEUED, RUNNING, SUCCEEDED, FAILED, UNKNOWN]
+
+    ActionRequest:
+      type: object
+      required: [action, expectedRevision]
+      additionalProperties: false
+      properties:
+        action: { $ref: "#/components/schemas/Action" }
+        expectedRevision: { type: integer, minimum: 0 }
+        transitionId:
+          type: string
+          description: Required for QUIESCE, CUTOVER, RESUME and ROLLBACK; refused for the rest.
+        quiesceRef:
+          type: string
+          description: Required with transitionId. Kept on the operation; not checked, since apps keep writing.
+        expectedLocation:
+          type: string
+          enum: [SOURCE, TARGET]
+          description: Required for RESUME. TARGET after CUTOVER, SOURCE after ROLLBACK.
+        deadlineMs:
+          type: integer
+          minimum: 0
+          maximum: 3600000
+          description: This server's own. How long CUTOVER, FINALIZE or CANCEL waits for apps. Default CONFIRM_TIMEOUT.
+
+    CreatePlan:
+      type: object
+      required: [workflowId, resourceId, kind, profile, sourceRef, targetRef, workloadScopeRef, bindingRef, policy]
+      additionalProperties: false
+      properties:
+        workflowId: { type: string }
+        resourceId: { type: string }
+        kind: { type: string, enum: [OBJECT_STORAGE] }
+        profile: { type: string, enum: [object-copy-route-v1] }
+        sourceRef: { type: string, example: "resource:aws-receipts" }
+        targetRef: { type: string, example: "resource:gcp-receipts" }
+        workloadScopeRef: { type: string }
+        bindingRef: { type: string }
+        policy:
+          type: object
+          required: [rollbackMode, maxQuiesceSeconds]
+          properties:
+            rollbackMode: { type: string, enum: [REVERSE_REQUIRED] }
+            maxQuiesceSeconds: { type: integer, minimum: 1, description: Kept; object storage does not pause apps. }
+        replicationRef: { type: "null" }
+
+    CommonDecision:
+      type: object
+      required: [result, reasons]
+      properties:
+        result: { type: string, enum: [PASS, FAIL, UNKNOWN] }
+        reasons: { type: array, items: { type: string } }
+
+    CommonCheck:
+      type: object
+      required: [code, stage, required, decision, evidenceRef, observedAt, validUntil, transitionId, topologyRevision]
+      properties:
+        code: { type: string }
+        stage: { type: string, enum: [QUIESCE, CUTOVER, RESUME, ADVANCE, ROLLBACK] }
+        required: { type: boolean }
+        decision: { $ref: "#/components/schemas/CommonDecision" }
+        evidenceRef: { type: [string, "null"], description: Set when the decision is PASS. }
+        observedAt: { type: string, format: date-time }
+        validUntil: { type: string, format: date-time, description: observedAt plus 30 seconds. }
+        transitionId: { type: [string, "null"] }
+        topologyRevision: { type: integer }
+
+    ServerError:
       type: object
       properties:
-        type: { type: string }
-        kind: { type: string, enum: [OBJECT_STORAGE] }
-        actions:
+        code: { type: string }
+        message: { type: string }
+        retryable: { type: boolean }
+
+    Capabilities:
+      type: object
+      required: [apiVersion, profiles]
+      properties:
+        apiVersion: { type: string, const: v1 }
+        profiles:
           type: array
-          items: { type: string }
+          items:
+            type: object
+            required: [kind, profile, sourceConditions, targetConditions, actions, rollbackModes, constraints]
+            properties:
+              kind: { type: string, enum: [OBJECT_STORAGE] }
+              profile: { type: string }
+              sourceConditions: { type: array, items: { type: string } }
+              targetConditions: { type: array, items: { type: string } }
+              actions: { type: array, items: { $ref: "#/components/schemas/Action" } }
+              rollbackModes: { type: array, items: { type: string } }
+              constraints: { type: array, items: { type: string } }
         engine: { type: string }
         sourceKinds:
           type: array
@@ -616,20 +742,22 @@ components:
         targetKinds:
           type: array
           items: { $ref: "#/components/schemas/Kind" }
-        commands:
-          type: array
-          items: { type: string }
+        directions: { type: array, items: { type: object } }
 
     Error:
       type: object
-      required: [code, message, retryable]
+      required: [code, message, operationId, blockers]
       properties:
         code:
           type: string
           description: |
-            INVALID_ARGUMENT (400), UNSUPPORTED_ACTION (400), UNAUTHENTICATED (401),
-            NOT_FOUND (404), INVALID_PHASE (409),
-            COMMAND_PENDING (409), PRECONDITION_FAILED (409), VERSION_CONFLICT (409),
-            IDEMPOTENCY_KEY_REUSED (422), INTERNAL (500), ENGINE_ERROR (in lastError only)
+            INVALID_REQUEST (400), UNAUTHENTICATED (401), NOT_FOUND (404),
+            REVISION_CONFLICT, RESOURCE_BUSY, INVALID_STATE, UNKNOWN_STATE,
+            IDEMPOTENCY_CONFLICT (409), UNSUPPORTED_PROFILE,
+            PRECONDITION_FAILED (422), INTERNAL (500)
         message: { type: string }
-        retryable: { type: boolean }
+        operationId: { type: [string, "null"] }
+        blockers: { type: array, items: { type: string } }
+        retryable:
+          type: boolean
+          description: This server's own. A retryable answer is not replayed for the same Idempotency-Key.

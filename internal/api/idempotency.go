@@ -62,11 +62,7 @@ func (i *idempotency) wrap(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if ok {
 			if s.Fingerprint != fp {
-				writeError(w, &apiError{
-					Code:    "IDEMPOTENCY_KEY_REUSED",
-					Message: "Idempotency-Key was already used for a different request",
-					status:  http.StatusUnprocessableEntity,
-				})
+				writeError(w, newError(http.StatusConflict, "IDEMPOTENCY_CONFLICT", "Idempotency-Key was already used for a different request"))
 				return
 			}
 			if s.Location != "" {

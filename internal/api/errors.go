@@ -8,44 +8,66 @@ import (
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 )
 
-// apiError is the error body shared by all migration servers.
+// apiError is the error body of the team's common API: code, message,
+// operationId and blockers. retryable is this server's addition; a client
+// that retries with the same Idempotency-Key gets a fresh answer for it.
 type apiError struct {
-	Code      string `json:"code"`
-	Message   string `json:"message"`
-	Retryable bool   `json:"retryable"`
+	Code        string   `json:"code"`
+	Message     string   `json:"message"`
+	OperationID *string  `json:"operationId"`
+	Blockers    []string `json:"blockers"`
+	Retryable   bool     `json:"retryable"`
 
 	status int
 }
 
 func (e *apiError) Error() string { return e.Message }
 
+func newError(status int, code, msg string, blockers ...string) *apiError {
+	if blockers == nil {
+		blockers = []string{}
+	}
+	return &apiError{Code: code, Message: msg, Blockers: blockers, status: status}
+}
+
 func badRequest(msg string) error {
-	return &apiError{Code: "INVALID_ARGUMENT", Message: msg, status: http.StatusBadRequest}
+	return newError(http.StatusBadRequest, "INVALID_REQUEST", msg)
 }
 
 func notFound(msg string) error {
-	return &apiError{Code: "NOT_FOUND", Message: msg, status: http.StatusNotFound}
+	return newError(http.StatusNotFound, "NOT_FOUND", msg)
+}
+
+func invalidState(msg string) error {
+	return newError(http.StatusConflict, "INVALID_STATE", msg)
 }
 
 func writeError(w http.ResponseWriter, err error) {
-	writeJSON(w, toAPIError(err).status, toAPIError(err))
+	e := toAPIError(err)
+	writeJSON(w, e.status, e)
 }
 
 func toAPIError(err error) *apiError {
 	var ae *apiError
+	var e *apiError
 	switch {
 	case errors.As(err, &ae):
 		return ae
 	case errors.Is(err, store.ErrNotFound):
-		return &apiError{Code: "NOT_FOUND", Message: err.Error(), status: http.StatusNotFound}
+		e = newError(http.StatusNotFound, "NOT_FOUND", err.Error())
 	case errors.Is(err, migration.ErrInvalidPhase):
-		return &apiError{Code: "INVALID_PHASE", Message: err.Error(), status: http.StatusConflict}
+		e = newError(http.StatusConflict, "INVALID_STATE", err.Error())
 	case errors.Is(err, migration.ErrCommandPending):
-		return &apiError{Code: "COMMAND_PENDING", Message: err.Error(), Retryable: true, status: http.StatusConflict}
+		e = newError(http.StatusConflict, "RESOURCE_BUSY", err.Error())
+		e.Retryable = true
 	case errors.Is(err, migration.ErrVersionMismatch):
-		return &apiError{Code: "VERSION_CONFLICT", Message: err.Error(), status: http.StatusConflict}
+		e = newError(http.StatusConflict, "REVISION_CONFLICT", err.Error())
 	case errors.Is(err, migration.ErrPrecondition):
-		return &apiError{Code: "PRECONDITION_FAILED", Message: err.Error(), Retryable: true, status: http.StatusConflict}
+		e = newError(http.StatusUnprocessableEntity, "PRECONDITION_FAILED", err.Error())
+		e.Retryable = true
+	default:
+		e = newError(http.StatusInternalServerError, "INTERNAL", "internal error")
+		e.Retryable = true
 	}
-	return &apiError{Code: "INTERNAL", Message: "internal error", Retryable: true, status: http.StatusInternalServerError}
+	return e
 }

@@ -65,29 +65,37 @@ The status response shows, per migration:
 - `replication.initialCopy`: objects and bytes copied out of the total
 - `readiness.cutover`, `readiness.advance`, `readiness.rollback`: PASS, FAIL, or UNKNOWN for freezing, finalizing, and going back, with the checks behind each
 - `routing`: the route apps use now: its generation, where they write, read and delete
-- `lifecycle` and `health`: the same step in the team's common names (`READY`, `QUIESCED`, `SWITCHED`, `ACTIVE`, ...) and `OK`, `FAILED` or `UNKNOWN`
-- `allowedActions`: the actions accepted right now (`allowedCommands` gives them as path commands)
-- `revision`: changes only when the phase changes or a command is accepted, so an orchestrator can send it back as `expectedRevision`
-- `operations`: every accepted command and how it ended
+- `lifecycle`, `health`, `allowedActions`, `readiness`, `checks`, `observed`: the same, in the team's common form (below)
+- `revision`: changes only when the phase changes or an action is accepted, so an orchestrator can send it back as `expectedRevision`
+- `operations`: every accepted action and how it ended
 
 ## Orchestrator API
 
-The orchestrator drives the server with the team's common API, draft 0.2, as far as it fits object storage:
+The orchestrator drives the server with the team's common migration API, draft 0.2: the same contract as the DB and Redis servers. Responses validate against that contract's schemas (checked against `db-migration-adaptor`'s `contract.json`), with this server's own fields added after the common ones.
 
-| Common API | Here |
-| --- | --- |
-| `POST /v1/migrations/{id}/actions` with `QUIESCE`, `CUTOVER`, `RESUME`, `ROLLBACK`, `FINALIZE`, `CANCEL` | Same. They run freeze, switch, resume, rollback, finalize and abort |
-| `PREPARE`, `START_SYNC` | Rejected with `UNSUPPORTED_ACTION`. `POST /v1/preflight` checks access; `POST /v1/migrations` starts the initial copy at once |
-| `RECONCILE` | Rejected. The worker reads the buckets and app routes again after every restart |
-| `GET /v1/operations/{id}` | Same. `RUNNING`, `SUCCEEDED`, `FAILED` or `UNKNOWN` |
-| `expectedRevision` | Required on every action |
-| `transitionId` | Required for QUIESCE, CUTOVER, RESUME and ROLLBACK |
-| `quiesceRef` | Kept on the operation; not checked, since apps keep writing through the switch |
-| `expectedLocation` | Required for RESUME and must be `TARGET`. A rollback already puts apps back on the source and ends in `RESTORED`, with no RESUME |
-| `Authorization: Bearer` | Required on every control route when `API_TOKEN` is set. Apps call `.../routing` and `.../deletes` with no token |
-| `Idempotency-Key` | Same. A repeat returns the first response |
+| Step | Request | Here |
+| --- | --- | --- |
+| Plan | `POST /v1/migrations` with `workflowId`, `kind: OBJECT_STORAGE`, `profile: object-copy-route-v1`, `sourceRef`, `targetRef`, ... | 201, CREATED. Touches nothing. `sourceRef` and `targetRef` name buckets registered in `OBJECT_RESOURCES` as `resource:<name>` |
+| `PREPARE` | `POST /v1/migrations/{id}/actions` | Checks access and that the target is clean, starts following the source's changes. PREPARED. A failed check fails the operation and leaves the plan in CREATED |
+| `START_SYNC` | | Starts the full copy. SYNCING, then READY when the copy is caught up |
+| `QUIESCE` | `transitionId`, `quiesceRef` | Records the cutover attempt. Apps keep writing. QUIESCED |
+| `CUTOVER` | | Apps read both buckets, then write to the target, each step confirmed by every app. SWITCHED |
+| `RESUME` | `expectedLocation: TARGET` | Starts copying the target's changes back to the source. ACTIVE |
+| `ROLLBACK` | | Copies the target's new objects back and moves apps to the source. ROLLED_BACK_HELD |
+| `RESUME` | `expectedLocation: SOURCE` | Confirms apps are on the source; changes nothing. RESTORED |
+| `CANCEL` | | Before CUTOVER. CANCELLED; the target keeps what was copied |
+| `RECONCILE` | | Compares the record with what apps report (route generation, apps not on it); changes nothing outside the record. After an unknown outcome it is the only action accepted until run |
+| `FINALIZE` | | ACTIVE: stops reading and deleting from the source. RESTORED: closes the plan. COMPLETED |
+| Result | `GET /v1/operations/{id}` | `RUNNING`, `SUCCEEDED`, `FAILED` or `UNKNOWN`, with `error` and `confirmedChanges` |
 
-The older path commands (`POST /v1/migrations/{id}/freeze` and the rest) still work.
+Every POST needs an `Idempotency-Key`; a repeat returns the first answer. Every action needs `expectedRevision`. One cutover attempt per migration: the first `QUIESCE` sets `transitionId`, and later held actions must repeat it. With `API_TOKEN` set, control routes need `Authorization: Bearer`; apps call `.../routing` and `.../deletes` with no token.
+
+Where object storage differs from the DB and Redis servers:
+- `QUIESCE` holds nothing and `quiesceRef` is kept but not checked: apps keep writing through the cutover.
+- `readiness.advance` is never PASS from this server alone. `WORKLOAD_RUNNING` and `BUSINESS_PROBE` are UNKNOWN, as in the Redis server: they are the orchestrator's evidence.
+- An unknown outcome means some apps did not confirm a new route in time. After `RECONCILE`, `ROLLBACK` is allowed; if the apps catch up, the worker finishes the command on its own.
+
+The older forms still work for existing tools: `POST /v1/migrations` with inline `source` and `target` starts at once (202), and the path commands (`POST /v1/migrations/{id}/freeze` and the rest) run without the common checks.
 
 ## On-prem storage
 
@@ -134,6 +142,7 @@ ENGINE=fake FAKE_STEP_DELAY=500ms go run ./cmd/object-migration
 | `DYNAMODB_TABLE` | | DynamoDB table for the server's state, created with on-demand capacity if missing. Reached with the platform's AWS credentials (the SDK's default chain, e.g. `AWS_PROFILE`). Unset: state lives in memory and is lost on restart |
 | `DYNAMODB_REGION` | `ap-northeast-2` | Region of `DYNAMODB_TABLE` |
 | `API_TOKEN` | | Bearer token the orchestrator must send. Unset: control routes are open (logged as a warning) |
+| `OBJECT_RESOURCES` | | JSON file of the buckets a plan may name: `{"aws-receipts": {"kind": "s3", "bucket": "...", "region": "ap-northeast-2", "ref": "default"}, ...}` |
 | `DYNAMODB_ENDPOINT` | | Endpoint override, e.g. DynamoDB Local |
 | `ENGINE` | `rclone` | `rclone` copies real objects; `fake` only pretends |
 | `POLL_INTERVAL` | `2s` | How often a waiting migration rechecks, and the retry backoff |
@@ -160,12 +169,16 @@ curl -s -X POST localhost:8080/v1/migrations/$ID/resume       # wait for VERIFYI
 curl -s -X POST localhost:8080/v1/migrations/$ID/finalize
 ```
 
-Or with the common actions, as the orchestrator does:
+Or as the orchestrator does, with a registered plan (`OBJECT_RESOURCES` set):
 
 ```sh
-REV=$(curl -s localhost:8080/v1/migrations/$ID | jq .revision)
-curl -si -X POST localhost:8080/v1/migrations/$ID/actions -H 'Idempotency-Key: q-1' \
-  -d "{\"action\":\"QUIESCE\",\"expectedRevision\":$REV,\"transitionId\":\"tx-1\"}"   # Location: /v1/operations/...
+PLAN='{"workflowId":"wf-1","resourceId":"receipts","kind":"OBJECT_STORAGE","profile":"object-copy-route-v1","sourceRef":"resource:aws-receipts","targetRef":"resource:gcp-receipts","workloadScopeRef":"workload:demo","bindingRef":"binding:receipts","policy":{"rollbackMode":"REVERSE_REQUIRED","maxQuiesceSeconds":30}}'
+ID=$(curl -s -X POST localhost:8080/v1/migrations -H 'Idempotency-Key: plan-1' -d "$PLAN" | jq -r .migrationId)
+act() { curl -si -X POST localhost:8080/v1/migrations/$ID/actions -H "Idempotency-Key: $1-$(date +%s)" \
+  -d "{\"action\":\"$1\",\"expectedRevision\":$(curl -s localhost:8080/v1/migrations/$ID | jq .revision)$2}"; }
+act PREPARE       # then wait for lifecycle PREPARED
+act START_SYNC    # then wait for READY
+act QUIESCE ',"transitionId":"tx-1","quiesceRef":"q-1"'      # Location: /v1/operations/...
 ```
 
 Simulate app servers during a migration with `appsim`: it writes, reads each other's objects and deletes through the app storage module, counts every failed request, and writes the keys it left and deleted to compare with the buckets. It reports request times per migration step (the route each app held when it sent the request) and the longest time an app went without a successful write, and logs every request to `requests.csv` in `-out`. With `-direct` it sends the same requests straight to one bucket, without a migration, as a baseline.

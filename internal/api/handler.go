@@ -4,6 +4,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -45,6 +46,9 @@ type Deps struct {
 	Deletes *routing.Deletes
 	// Directions, when set, is reported by /v1/capabilities.
 	Directions any
+	// Resources are the buckets a common-API plan may name, as
+	// "resource:<name>" in sourceRef and targetRef.
+	Resources map[string]migration.Endpoint
 	// Token, when set, is the Bearer token the orchestrator must send on
 	// every control route. App routes (routing, deletes) stay open.
 	Token  string
@@ -103,22 +107,6 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 
 var allKinds = []migration.Kind{migration.KindS3, migration.KindGCS, migration.KindSeaweedFS}
 
-func (h *handler) capabilities(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"type":        migration.Type,
-		"kind":        "OBJECT_STORAGE",
-		"actions":     supportedActions,
-		"engine":      h.Engine,
-		"sourceKinds": allKinds,
-		"targetKinds": allKinds,
-		"commands": []migration.Command{
-			migration.CommandFreeze, migration.CommandSwitch, migration.CommandResume,
-			migration.CommandRollback, migration.CommandFinalize, migration.CommandAbort,
-		},
-		"directions": h.Directions,
-	})
-}
-
 type endpointsRequest struct {
 	Source migration.Endpoint `json:"source"`
 	Target migration.Endpoint `json:"target"`
@@ -158,7 +146,22 @@ func endpointCheck(name string, e migration.Endpoint) migration.Check {
 	return migration.Check{Name: name, OK: true}
 }
 
+// create registers a common-API plan when the body names a workflowId, and
+// otherwise creates a migration from inline endpoints and starts it at once.
 func (h *handler) create(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		writeError(w, badRequest("read body: "+err.Error()))
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	var probe map[string]json.RawMessage
+	if json.Unmarshal(body, &probe) == nil {
+		if _, ok := probe["workflowId"]; ok {
+			h.createPlan(w, r)
+			return
+		}
+	}
 	var req endpointsRequest
 	if err := decode(w, r, &req); err != nil {
 		writeError(w, err)
@@ -176,7 +179,7 @@ func (h *handler) create(w http.ResponseWriter, r *http.Request) {
 	}
 	h.Notifier.Notify(m.ID)
 	w.Header().Set("Location", "/v1/migrations/"+m.ID)
-	writeMigration(w, http.StatusAccepted, m)
+	h.writeMigration(w, http.StatusAccepted, m)
 }
 
 func (h *handler) get(w http.ResponseWriter, r *http.Request) {
@@ -185,7 +188,7 @@ func (h *handler) get(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeMigration(w, http.StatusOK, m)
+	h.writeMigration(w, http.StatusOK, m)
 }
 
 // routeEndpoint is a bucket as apps see it: where it is, but not the
@@ -278,32 +281,6 @@ func (h *handler) deletes(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// migrationView is a migration as the API returns it, with the common
-// lifecycle and health and what the client may send next: allowedActions
-// for POST .../actions, allowedCommands for the path commands.
-type migrationView struct {
-	migration.Migration
-	Kind            string              `json:"kind"`
-	Lifecycle       string              `json:"lifecycle"`
-	Health          string              `json:"health"`
-	AllowedActions  []Action            `json:"allowedActions"`
-	AllowedCommands []migration.Command `json:"allowedCommands"`
-}
-
-func writeMigration(w http.ResponseWriter, status int, m migration.Migration) {
-	cmds := m.AllowedCommands()
-	actions := []Action{}
-	for _, a := range supportedActions {
-		if slices.Contains(cmds, actionCommands[a]) {
-			actions = append(actions, a)
-		}
-	}
-	writeJSON(w, status, migrationView{
-		Migration: m, Kind: "OBJECT_STORAGE", Lifecycle: lifecycle(m.Phase), Health: health(m),
-		AllowedActions: actions, AllowedCommands: cmds,
-	})
-}
-
 // pathCommands are the commands sent as POST /v1/migrations/{id}/{command}.
 // Abort is sent as DELETE.
 var pathCommands = map[string]migration.Command{
@@ -372,7 +349,7 @@ func (h *handler) request(w http.ResponseWriter, r *http.Request, req migration.
 		return
 	}
 	h.Notifier.Notify(m.ID)
-	writeMigration(w, http.StatusAccepted, m)
+	h.writeMigration(w, http.StatusAccepted, m)
 }
 
 // decode reads a required JSON body and rejects unknown fields.

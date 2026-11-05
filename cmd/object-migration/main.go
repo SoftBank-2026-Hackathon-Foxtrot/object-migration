@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/api"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/copier"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/engine"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/routing"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/worker"
@@ -64,6 +66,10 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 
+	resources, err := loadResources(os.Getenv("OBJECT_RESOURCES"))
+	if err != nil {
+		return err
+	}
 	st, deletes, err := openStore(logger)
 	if err != nil {
 		return err
@@ -93,6 +99,7 @@ func run(logger *slog.Logger) error {
 			Deletes:    deletes,
 			Directions: directions,
 			Token:      os.Getenv("API_TOKEN"),
+			Resources:  resources,
 			Logger:     logger,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -229,4 +236,26 @@ func durationEnv(key string, def time.Duration) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: want a positive duration like 2s, got %q", key, v)
 	}
 	return d, nil
+}
+
+// loadResources reads the buckets common-API plans may name: a JSON object
+// from name to endpoint, e.g. {"aws-receipts": {"kind": "s3", "bucket": ...}}.
+func loadResources(path string) (map[string]migration.Endpoint, error) {
+	if path == "" {
+		return nil, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("OBJECT_RESOURCES: %w", err)
+	}
+	var out map[string]migration.Endpoint
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("OBJECT_RESOURCES %s: %w", path, err)
+	}
+	for name, e := range out {
+		if err := e.Validate(); err != nil {
+			return nil, fmt.Errorf("OBJECT_RESOURCES %s: %s: %w", path, name, err)
+		}
+	}
+	return out, nil
 }

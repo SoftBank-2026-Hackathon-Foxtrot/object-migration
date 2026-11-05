@@ -72,7 +72,10 @@ func (e Endpoint) Validate() error {
 type Phase string
 
 const (
-	PhaseCreated     Phase = "CREATED"
+	PhaseCreated Phase = "CREATED"
+	// PhasePrepared: the change feed is set up; the copy waits for
+	// START_SYNC. Only plans created through the common API stop here.
+	PhasePrepared    Phase = "PREPARED"
 	PhaseInitialSync Phase = "INITIAL_SYNC"
 	PhaseSyncing     Phase = "SYNCING"
 	PhaseReady       Phase = "READY"
@@ -98,7 +101,8 @@ func (p Phase) Terminal() bool {
 
 // next lists the phases the worker may move to from each phase.
 var next = map[Phase][]Phase{
-	PhaseCreated:     {PhaseInitialSync, PhaseAborted, PhaseFailed},
+	PhaseCreated:     {PhasePrepared, PhaseInitialSync, PhaseAborted, PhaseFailed},
+	PhasePrepared:    {PhaseInitialSync, PhaseAborted, PhaseFailed},
 	PhaseInitialSync: {PhaseSyncing, PhaseAborted, PhaseFailed},
 	PhaseSyncing:     {PhaseReady, PhaseAborted, PhaseFailed},
 	PhaseReady:       {PhaseSyncing, PhaseFrozen, PhaseAborted, PhaseFailed},
@@ -132,20 +136,30 @@ const (
 	CommandRollback Command = "rollback"
 	CommandFinalize Command = "finalize"
 	CommandAbort    Command = "abort"
+	// CommandPrepare checks access and sets up the change feed of a plan.
+	CommandPrepare Command = "prepare"
+	// CommandStartSync starts the initial copy of a prepared plan.
+	CommandStartSync Command = "start_sync"
+	// CommandReconcile and the commands below are recorded as operations
+	// but never pending: they finish when accepted.
+	CommandReconcile Command = "reconcile"
 )
 
 // allowedIn lists the phases in which each command is accepted.
 var allowedIn = map[Command][]Phase{
-	CommandFreeze:   {PhaseReady},
-	CommandSwitch:   {PhaseFrozen},
-	CommandResume:   {PhaseSwitched},
-	CommandRollback: {PhaseFrozen, PhaseSwitched, PhaseResumed, PhaseVerifying},
-	CommandFinalize: {PhaseVerifying},
-	CommandAbort:    {PhaseCreated, PhaseInitialSync, PhaseSyncing, PhaseReady, PhaseFrozen},
+	CommandFreeze:    {PhaseReady},
+	CommandSwitch:    {PhaseFrozen},
+	CommandResume:    {PhaseSwitched},
+	CommandRollback:  {PhaseFrozen, PhaseSwitched, PhaseResumed, PhaseVerifying},
+	CommandFinalize:  {PhaseVerifying},
+	CommandAbort:     {PhaseCreated, PhasePrepared, PhaseInitialSync, PhaseSyncing, PhaseReady, PhaseFrozen},
+	CommandPrepare:   {PhaseCreated},
+	CommandStartSync: {PhasePrepared},
 }
 
 // commandOrder fixes the order of allowedActions in responses.
 var commandOrder = []Command{
+	CommandPrepare, CommandStartSync,
 	CommandFreeze, CommandSwitch, CommandResume, CommandRollback, CommandFinalize, CommandAbort,
 }
 
@@ -189,18 +203,22 @@ type Operation struct {
 	QuiesceRef   string          `json:"quiesceRef,omitempty"`
 	Status       OperationStatus `json:"status"`
 	Message      string          `json:"message,omitempty"`
-	RequestedAt  time.Time       `json:"requestedAt"`
-	FinishedAt   *time.Time      `json:"finishedAt,omitempty"`
+	// Changes lists what the operation is known to have changed.
+	Changes     []string   `json:"confirmedChanges,omitempty"`
+	RequestedAt time.Time  `json:"requestedAt"`
+	FinishedAt  *time.Time `json:"finishedAt,omitempty"`
 }
 
 // doneIn is the phase in which each command has finished.
 var doneIn = map[Command]Phase{
-	CommandFreeze:   PhaseFrozen,
-	CommandSwitch:   PhaseSwitched,
-	CommandResume:   PhaseResumed,
-	CommandRollback: PhaseRolledBack,
-	CommandFinalize: PhaseCompleted,
-	CommandAbort:    PhaseAborted,
+	CommandFreeze:    PhaseFrozen,
+	CommandSwitch:    PhaseSwitched,
+	CommandResume:    PhaseResumed,
+	CommandRollback:  PhaseRolledBack,
+	CommandFinalize:  PhaseCompleted,
+	CommandAbort:     PhaseAborted,
+	CommandPrepare:   PhasePrepared,
+	CommandStartSync: PhaseInitialSync,
 }
 
 type Progress struct {
@@ -321,9 +339,31 @@ type Migration struct {
 	// Operations lists every accepted command, oldest first.
 	Operations []Operation `json:"operations,omitempty"`
 	// ActiveOperation is the operation still running, if any.
-	ActiveOperation string    `json:"activeOperationId,omitempty"`
-	CreatedAt       time.Time `json:"createdAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
+	ActiveOperation string `json:"activeOperationId,omitempty"`
+	// Plan is set when the migration was created through the common API.
+	// Such a migration waits for PREPARE and START_SYNC instead of starting
+	// at once.
+	Plan *Plan `json:"plan,omitempty"`
+	// TransitionID is the one cutover attempt this migration allows; the
+	// first QUIESCE sets it.
+	TransitionID string `json:"transitionId,omitempty"`
+	// TransitionClosed is set when the attempt is over: finalized,
+	// cancelled after QUIESCE, or resumed on the source.
+	TransitionClosed bool `json:"transitionClosed,omitempty"`
+	// TargetWritesPossible turns true when a switch is accepted and never
+	// back: from then on apps may have written to the target.
+	TargetWritesPossible bool `json:"targetWritesPossible,omitempty"`
+	// RolledBackFrom is the phase a rollback started in.
+	RolledBackFrom Phase `json:"rolledBackFrom,omitempty"`
+	// Reconciled means RECONCILE looked at the current unknown outcome, so
+	// commands other than RECONCILE are accepted again.
+	Reconciled bool `json:"reconciled,omitempty"`
+	// SourceResumed: RESUME SOURCE confirmed apps are back on the source
+	// after a rollback. Finalized: FINALIZE closed a restored plan.
+	SourceResumed bool      `json:"sourceResumed,omitempty"`
+	Finalized     bool      `json:"finalized,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
 var (
@@ -399,6 +439,9 @@ func (m *Migration) RequestCommand(req CommandRequest) error {
 	if req.ExpectedRevision != 0 && req.ExpectedRevision != m.Revision {
 		return fmt.Errorf("%w: expected revision %d, current %d", ErrVersionMismatch, req.ExpectedRevision, m.Revision)
 	}
+	if (req.Command == CommandPrepare || req.Command == CommandStartSync) && m.Plan == nil {
+		return fmt.Errorf("%w: %s is only for plans created through the common API", ErrInvalidPhase, req.Command)
+	}
 	phases, ok := allowedIn[req.Command]
 	if !ok {
 		return fmt.Errorf("unknown command %q", req.Command)
@@ -418,6 +461,16 @@ func (m *Migration) RequestCommand(req CommandRequest) error {
 	r := req
 	m.Pending = &r
 	m.Revision++
+	switch req.Command {
+	case CommandFreeze:
+		if m.TransitionID == "" {
+			m.TransitionID = req.CutoverID
+		}
+	case CommandSwitch:
+		m.TargetWritesPossible = true
+	case CommandRollback:
+		m.RolledBackFrom = m.Phase
+	}
 	op := Operation{
 		ID:           fmt.Sprintf("%s-op%d", m.ID, len(m.Operations)+1),
 		Command:      req.Command,
@@ -437,6 +490,7 @@ func (m *Migration) finishOperation(status OperationStatus, msg string, at time.
 		if m.Operations[i].ID == m.ActiveOperation {
 			t := at
 			m.Operations[i].Status, m.Operations[i].Message, m.Operations[i].FinishedAt = status, msg, &t
+			m.Operations[i].Changes = append(m.Operations[i].Changes, m.Routing.String())
 		}
 	}
 	m.ActiveOperation = ""
@@ -600,4 +654,60 @@ func (m Migration) Endpoint(s Side) Endpoint {
 		return m.Target
 	}
 	return m.Source
+}
+
+// Policy is the common API's rollback policy for a plan.
+type Policy struct {
+	RollbackMode      string `json:"rollbackMode"`
+	MaxQuiesceSeconds int    `json:"maxQuiesceSeconds"`
+}
+
+// Plan is what a common-API create request registered.
+type Plan struct {
+	WorkflowID       string `json:"workflowId"`
+	ResourceID       string `json:"resourceId"`
+	Profile          string `json:"profile"`
+	SourceRef        string `json:"sourceRef"`
+	TargetRef        string `json:"targetRef"`
+	WorkloadScopeRef string `json:"workloadScopeRef"`
+	BindingRef       string `json:"bindingRef"`
+	Policy           Policy `json:"policy"`
+}
+
+// RecordDone records a command that finished as soon as it was accepted:
+// it changes nothing in the buckets or routes, so it needs no worker.
+func (m *Migration) RecordDone(cmd Command, transitionID string, status OperationStatus, msg string, changes []string, now time.Time) Operation {
+	t := now
+	op := Operation{
+		ID:           fmt.Sprintf("%s-op%d", m.ID, len(m.Operations)+1),
+		Command:      cmd,
+		TransitionID: transitionID,
+		Status:       status,
+		Message:      msg,
+		Changes:      changes,
+		RequestedAt:  now,
+		FinishedAt:   &t,
+	}
+	m.Operations = append(m.Operations, op)
+	m.Revision++
+	m.UpdatedAt = now
+	return op
+}
+
+// FailActive ends the active operation as failed without moving the
+// migration, for a command whose check failed before it changed anything.
+func (m *Migration) FailActive(msg string, now time.Time) {
+	m.Pending = nil
+	m.finishOperation(OperationFailed, msg, now)
+	m.Revision++
+	m.UpdatedAt = now
+}
+
+// String describes the route for operation records.
+func (r Route) String() string {
+	read := make([]string, len(r.Read))
+	for i, s := range r.Read {
+		read[i] = string(s)
+	}
+	return fmt.Sprintf("route generation %d: write %s, read %s", r.Generation, r.Write, strings.Join(read, "+"))
 }
