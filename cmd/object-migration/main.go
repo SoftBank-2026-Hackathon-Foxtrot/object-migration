@@ -92,6 +92,7 @@ func run(logger *slog.Logger) error {
 			Apps:       apps,
 			Deletes:    deletes,
 			Directions: directions,
+			Token:      os.Getenv("API_TOKEN"),
 			Logger:     logger,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -109,6 +110,9 @@ func run(logger *slog.Logger) error {
 	serveErr := make(chan error, 1)
 	go func() {
 		logger.Info("listening", "addr", addr, "engine", eng.Name(), "syncInterval", syncInterval.String())
+		if os.Getenv("API_TOKEN") == "" {
+			logger.Warn("API_TOKEN not set; control routes accept requests without a token")
+		}
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 		}
@@ -143,7 +147,7 @@ func openStore(logger *slog.Logger) (store.Store, *routing.Deletes, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(envOr("DYNAMODB_REGION", "ap-northeast-1")))
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(envOr("DYNAMODB_REGION", "ap-northeast-2")))
 	if err != nil {
 		return nil, nil, fmt.Errorf("DYNAMODB_TABLE: %w", err)
 	}

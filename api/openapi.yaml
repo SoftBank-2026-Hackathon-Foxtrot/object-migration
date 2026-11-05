@@ -1,12 +1,26 @@
 openapi: 3.1.0
 info:
   title: Migration server common API
-  version: 0.1.0
+  version: 0.2.0
   description: |
-    Draft of the API every migration server (object, DB, cache) implements.
-    The orchestrator drives a migration with commands; the server answers
-    202 at once and does the work in the background. Poll GET
-    /v1/migrations/{id} to follow progress.
+    Object storage server of the team's common migration API. It follows
+    common draft 0.2 where object storage fits: POST
+    /v1/migrations/{id}/actions with QUIESCE, CUTOVER, RESUME, ROLLBACK,
+    FINALIZE and CANCEL; GET /v1/operations/{id}; Bearer tokens;
+    Idempotency-Key; expectedRevision; and the common lifecycle and health
+    values. PREPARE, START_SYNC and RECONCILE are rejected with
+    UNSUPPORTED_ACTION: POST /v1/migrations starts the initial copy at once,
+    and the worker re-reads buckets and app routes after every restart.
+
+    The server answers 202 at once and does the work in the background.
+    Poll the operation's Location, or GET /v1/migrations/{id}.
+
+    When the server runs with API_TOKEN set, every route except /healthz,
+    .../routing and .../deletes needs Authorization: Bearer <token>. Apps
+    call those two with no token.
+
+    The older path commands (POST /v1/migrations/{id}/freeze and the rest)
+    still work for existing tools.
 
     Cutover is split into freeze, switch, and resume so the orchestrator can
     line several servers up. Each server decides what each command means for
@@ -189,6 +203,124 @@ paths:
         "400": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
 
+  /v1/migrations/{id}/actions:
+    parameters:
+      - $ref: "#/components/parameters/MigrationID"
+    post:
+      summary: Accept a common-API action
+      description: |
+        QUIESCE (READY) records the cutover attempt; object storage needs no
+        pause, so apps keep writing. CUTOVER (QUIESCED) moves app reads to
+        both buckets, then writes to the target, waiting for every app.
+        RESUME (SWITCHED) stops forward copying and starts copying the
+        target back. ROLLBACK (QUIESCED, SWITCHED, ACTIVE while
+        readiness.rollback is PASS) moves apps back to the source, which
+        ends in RESTORED with no RESUME. FINALIZE (ACTIVE while
+        readiness.advance is PASS) stops reading and deleting from the
+        source. CANCEL works before CUTOVER.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, expectedRevision]
+              additionalProperties: false
+              properties:
+                action:
+                  type: string
+                  enum: [QUIESCE, CUTOVER, RESUME, ROLLBACK, FINALIZE, CANCEL]
+                expectedRevision:
+                  type: integer
+                  minimum: 1
+                  description: Must equal the migration's revision, or 409 VERSION_CONFLICT.
+                transitionId:
+                  type: string
+                  description: Required for QUIESCE, CUTOVER, RESUME and ROLLBACK.
+                quiesceRef:
+                  type: string
+                  description: Kept on the operation for tracing; object storage does not check it.
+                expectedLocation:
+                  type: string
+                  enum: [TARGET]
+                  description: Required for RESUME. Only the target is resumed.
+                deadlineMs:
+                  type: integer
+                  minimum: 0
+                  maximum: 3600000
+                  description: How long CUTOVER, FINALIZE or CANCEL waits for apps. Default 30000.
+      responses:
+        "202":
+          description: Accepted, not finished. Follow Location.
+          headers:
+            Location:
+              schema: { type: string, example: /v1/operations/om-1a2b3c4d5e6f7a8b-op1 }
+            Retry-After:
+              schema: { type: integer, example: 1 }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [operationId, migrationId, action, status, statusUrl, revision]
+                properties:
+                  operationId: { type: string }
+                  migrationId: { type: string }
+                  action: { type: string }
+                  status: { type: string, enum: [QUEUED] }
+                  statusUrl: { type: string }
+                  revision: { type: integer }
+        "400": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
+        "422": { $ref: "#/components/responses/Error" }
+
+  /v1/operations/{operationId}:
+    parameters:
+      - name: operationId
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      summary: Outcome of one accepted action
+      responses:
+        "200":
+          description: |
+            RUNNING until the migration reaches the action's phase (ROLLBACK
+            runs on through ROLLING_BACK). UNKNOWN when the worker could not
+            confirm the outcome, for example apps that did not take a new
+            route before the deadline: send ROLLBACK or wait.
+          headers:
+            Retry-After:
+              description: Sent while the operation is still running.
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [operationId, migrationId, action, status, lifecycle, revision, requestedAt]
+                properties:
+                  operationId: { type: string }
+                  migrationId: { type: string }
+                  action: { type: string }
+                  command: { type: string }
+                  transitionId: { type: string }
+                  quiesceRef: { type: string }
+                  status: { type: string, enum: [RUNNING, SUCCEEDED, FAILED, UNKNOWN] }
+                  message: { type: string }
+                  lifecycle: { type: string }
+                  revision: { type: integer }
+                  requestedAt: { type: string, format: date-time }
+                  finishedAt: { type: string, format: date-time }
+                  lastError:
+                    oneOf:
+                      - type: "null"
+                      - { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+
   /v1/migrations/{id}/{command}:
     parameters:
       - $ref: "#/components/parameters/MigrationID"
@@ -199,7 +331,7 @@ paths:
           freeze (READY), switch (FROZEN), resume (SWITCHED),
           rollback (FROZEN, SWITCHED, RESUMED, VERIFYING while
           readiness.rollback is PASS), finalize (VERIFYING while
-          readiness.advance is PASS). allowedActions lists what is accepted now.
+          readiness.advance is PASS). allowedCommands lists what is accepted now.
         schema:
           type: string
           enum: [freeze, switch, resume, rollback, finalize]
@@ -262,7 +394,7 @@ components:
         region:
           type: string
           description: Bucket region. Required for s3.
-          example: ap-northeast-1
+          example: ap-northeast-2
         url:
           type: string
           description: S3-compatible endpoint. Required for seaweedfs.
@@ -377,10 +509,19 @@ components:
 
     Migration:
       type: object
-      required: [id, type, phase, state, source, target, replication, readiness, lastError, version, createdAt, updatedAt, allowedActions]
+      required: [id, type, kind, lifecycle, health, phase, state, source, target, replication, readiness, lastError, version, revision, createdAt, updatedAt, allowedActions, allowedCommands]
       properties:
         id: { type: string }
         type: { type: string, enum: [object, db, cache] }
+        kind: { type: string, enum: [OBJECT_STORAGE] }
+        lifecycle:
+          type: string
+          enum: [CREATED, SYNCING, READY, QUIESCED, SWITCHED, ACTIVE, COMPLETED, ROLLING_BACK, RESTORED, CANCELLED, FAILED]
+          description: |
+            Common lifecycle. INITIAL_SYNC and SYNCING are SYNCING, FROZEN is
+            QUIESCED, RESUMED and VERIFYING are ACTIVE, ROLLED_BACK is
+            RESTORED, ABORTED is CANCELLED. ROLLING_BACK is object storage's own.
+        health: { type: string, enum: [OK, FAILED, UNKNOWN] }
         phase: { $ref: "#/components/schemas/Phase" }
         state: { $ref: "#/components/schemas/State" }
         detail: { type: string, description: Server-specific sub-step for dashboards. }
@@ -431,8 +572,17 @@ components:
               description: Can the migration go back to the source now?
         allowedActions:
           type: array
-          description: Commands the server would accept now. Still checked again when sent.
+          description: Actions POST .../actions would accept now. Still checked again when sent.
+          items: { type: string, enum: [QUIESCE, CUTOVER, RESUME, ROLLBACK, FINALIZE, CANCEL] }
+        allowedCommands:
+          type: array
+          description: The same, as path commands.
           items: { type: string, enum: [freeze, switch, resume, rollback, finalize, abort] }
+        activeOperationId: { type: string, description: The operation still running, if any. }
+        operations:
+          type: array
+          description: Every accepted command, oldest first.
+          items: { type: object }
         pendingCommand:
           type: object
           properties:
@@ -446,7 +596,8 @@ components:
           oneOf:
             - type: "null"
             - { $ref: "#/components/schemas/Error" }
-        version: { type: integer }
+        version: { type: integer, description: Changes on every write, progress included. }
+        revision: { type: integer, description: Changes only when the phase changes or a command is accepted. }
         createdAt: { type: string, format: date-time }
         updatedAt: { type: string, format: date-time }
 
@@ -454,6 +605,10 @@ components:
       type: object
       properties:
         type: { type: string }
+        kind: { type: string, enum: [OBJECT_STORAGE] }
+        actions:
+          type: array
+          items: { type: string }
         engine: { type: string }
         sourceKinds:
           type: array
@@ -472,7 +627,8 @@ components:
         code:
           type: string
           description: |
-            INVALID_ARGUMENT (400), NOT_FOUND (404), INVALID_PHASE (409),
+            INVALID_ARGUMENT (400), UNSUPPORTED_ACTION (400), UNAUTHENTICATED (401),
+            NOT_FOUND (404), INVALID_PHASE (409),
             COMMAND_PENDING (409), PRECONDITION_FAILED (409), VERSION_CONFLICT (409),
             IDEMPOTENCY_KEY_REUSED (422), INTERNAL (500), ENGINE_ERROR (in lastError only)
         message: { type: string }

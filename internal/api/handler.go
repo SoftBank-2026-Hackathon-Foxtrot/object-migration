@@ -45,8 +45,11 @@ type Deps struct {
 	Deletes *routing.Deletes
 	// Directions, when set, is reported by /v1/capabilities.
 	Directions any
-	Logger     *slog.Logger
-	Now        func() time.Time
+	// Token, when set, is the Bearer token the orchestrator must send on
+	// every control route. App routes (routing, deletes) stay open.
+	Token  string
+	Logger *slog.Logger
+	Now    func() time.Time
 }
 
 type handler struct {
@@ -75,14 +78,18 @@ func NewHandler(d Deps) http.Handler {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.HandleFunc("GET /v1/capabilities", h.capabilities)
-	mux.HandleFunc("POST /v1/preflight", h.preflight)
-	mux.HandleFunc("POST /v1/migrations", h.idem.wrap(h.create))
-	mux.HandleFunc("GET /v1/migrations/{id}", h.get)
+	auth := func(next http.HandlerFunc) http.HandlerFunc { return bearer(d.Token, next) }
+	mux.HandleFunc("GET /v1/capabilities", auth(h.capabilities))
+	mux.HandleFunc("POST /v1/preflight", auth(h.preflight))
+	mux.HandleFunc("POST /v1/migrations", auth(h.idem.wrap(h.create)))
+	mux.HandleFunc("GET /v1/migrations/{id}", auth(h.get))
+	mux.HandleFunc("POST /v1/migrations/{id}/actions", auth(h.idem.wrap(h.action)))
+	mux.HandleFunc("GET /v1/operations/{id}", auth(h.operation))
+	mux.HandleFunc("POST /v1/migrations/{id}/{command}", auth(h.idem.wrap(h.command)))
+	mux.HandleFunc("DELETE /v1/migrations/{id}", auth(h.idem.wrap(h.abort)))
+	// Apps call these with no token; they reveal no credentials.
 	mux.HandleFunc("GET /v1/migrations/{id}/routing", h.routing)
 	mux.HandleFunc("POST /v1/migrations/{id}/deletes", h.deletes)
-	mux.HandleFunc("POST /v1/migrations/{id}/{command}", h.idem.wrap(h.command))
-	mux.HandleFunc("DELETE /v1/migrations/{id}", h.idem.wrap(h.abort))
 	return mux
 }
 
@@ -99,6 +106,8 @@ var allKinds = []migration.Kind{migration.KindS3, migration.KindGCS, migration.K
 func (h *handler) capabilities(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"type":        migration.Type,
+		"kind":        "OBJECT_STORAGE",
+		"actions":     supportedActions,
 		"engine":      h.Engine,
 		"sourceKinds": allKinds,
 		"targetKinds": allKinds,
@@ -269,15 +278,30 @@ func (h *handler) deletes(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// migrationView is a migration as the API returns it, with the commands the
-// client may send next.
+// migrationView is a migration as the API returns it, with the common
+// lifecycle and health and what the client may send next: allowedActions
+// for POST .../actions, allowedCommands for the path commands.
 type migrationView struct {
 	migration.Migration
-	AllowedActions []migration.Command `json:"allowedActions"`
+	Kind            string              `json:"kind"`
+	Lifecycle       string              `json:"lifecycle"`
+	Health          string              `json:"health"`
+	AllowedActions  []Action            `json:"allowedActions"`
+	AllowedCommands []migration.Command `json:"allowedCommands"`
 }
 
 func writeMigration(w http.ResponseWriter, status int, m migration.Migration) {
-	writeJSON(w, status, migrationView{Migration: m, AllowedActions: m.AllowedCommands()})
+	cmds := m.AllowedCommands()
+	actions := []Action{}
+	for _, a := range supportedActions {
+		if slices.Contains(cmds, actionCommands[a]) {
+			actions = append(actions, a)
+		}
+	}
+	writeJSON(w, status, migrationView{
+		Migration: m, Kind: "OBJECT_STORAGE", Lifecycle: lifecycle(m.Phase), Health: health(m),
+		AllowedActions: actions, AllowedCommands: cmds,
+	})
 }
 
 // pathCommands are the commands sent as POST /v1/migrations/{id}/{command}.

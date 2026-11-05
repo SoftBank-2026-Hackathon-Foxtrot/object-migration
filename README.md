@@ -65,7 +65,29 @@ The status response shows, per migration:
 - `replication.initialCopy`: objects and bytes copied out of the total
 - `readiness.cutover`, `readiness.advance`, `readiness.rollback`: PASS, FAIL, or UNKNOWN for freezing, finalizing, and going back, with the checks behind each
 - `routing`: the route apps use now: its generation, where they write, read and delete
-- `allowedActions`: the commands accepted right now
+- `lifecycle` and `health`: the same step in the team's common names (`READY`, `QUIESCED`, `SWITCHED`, `ACTIVE`, ...) and `OK`, `FAILED` or `UNKNOWN`
+- `allowedActions`: the actions accepted right now (`allowedCommands` gives them as path commands)
+- `revision`: changes only when the phase changes or a command is accepted, so an orchestrator can send it back as `expectedRevision`
+- `operations`: every accepted command and how it ended
+
+## Orchestrator API
+
+The orchestrator drives the server with the team's common API, draft 0.2, as far as it fits object storage:
+
+| Common API | Here |
+| --- | --- |
+| `POST /v1/migrations/{id}/actions` with `QUIESCE`, `CUTOVER`, `RESUME`, `ROLLBACK`, `FINALIZE`, `CANCEL` | Same. They run freeze, switch, resume, rollback, finalize and abort |
+| `PREPARE`, `START_SYNC` | Rejected with `UNSUPPORTED_ACTION`. `POST /v1/preflight` checks access; `POST /v1/migrations` starts the initial copy at once |
+| `RECONCILE` | Rejected. The worker reads the buckets and app routes again after every restart |
+| `GET /v1/operations/{id}` | Same. `RUNNING`, `SUCCEEDED`, `FAILED` or `UNKNOWN` |
+| `expectedRevision` | Required on every action |
+| `transitionId` | Required for QUIESCE, CUTOVER, RESUME and ROLLBACK |
+| `quiesceRef` | Kept on the operation; not checked, since apps keep writing through the switch |
+| `expectedLocation` | Required for RESUME and must be `TARGET`. A rollback already puts apps back on the source and ends in `RESTORED`, with no RESUME |
+| `Authorization: Bearer` | Required on every control route when `API_TOKEN` is set. Apps call `.../routing` and `.../deletes` with no token |
+| `Idempotency-Key` | Same. A repeat returns the first response |
+
+The older path commands (`POST /v1/migrations/{id}/freeze` and the rest) still work.
 
 ## On-prem storage
 
@@ -110,7 +132,8 @@ ENGINE=fake FAKE_STEP_DELAY=500ms go run ./cmd/object-migration
 | --- | --- | --- |
 | `ADDR` | `:8080` | Listen address |
 | `DYNAMODB_TABLE` | | DynamoDB table for the server's state, created with on-demand capacity if missing. Reached with the platform's AWS credentials (the SDK's default chain, e.g. `AWS_PROFILE`). Unset: state lives in memory and is lost on restart |
-| `DYNAMODB_REGION` | `ap-northeast-1` | Region of `DYNAMODB_TABLE` |
+| `DYNAMODB_REGION` | `ap-northeast-2` | Region of `DYNAMODB_TABLE` |
+| `API_TOKEN` | | Bearer token the orchestrator must send. Unset: control routes are open (logged as a warning) |
 | `DYNAMODB_ENDPOINT` | | Endpoint override, e.g. DynamoDB Local |
 | `ENGINE` | `rclone` | `rclone` copies real objects; `fake` only pretends |
 | `POLL_INTERVAL` | `2s` | How often a waiting migration rechecks, and the retry backoff |
@@ -130,11 +153,19 @@ Drive a migration with curl:
 BODY='{"source":{"kind":"s3","bucket":"foxtrot-om-src-test","region":"ap-northeast-1","ref":"default"},"target":{"kind":"gcs","bucket":"foxtrot-om-dst-test","ref":"default"}}'
 curl -s -X POST localhost:8080/v1/preflight -d "$BODY" | jq        # can the server read both and write the target?
 ID=$(curl -s -X POST localhost:8080/v1/migrations -d "$BODY" | jq -r .id)
-curl -s localhost:8080/v1/migrations/$ID | jq '{phase,state,replication,readiness,allowedActions}'   # wait for READY
+curl -s localhost:8080/v1/migrations/$ID | jq '{lifecycle,phase,state,replication,readiness,allowedActions,revision}'   # wait for READY
 curl -s -X POST localhost:8080/v1/migrations/$ID/freeze
 curl -s -X POST localhost:8080/v1/migrations/$ID/switch
 curl -s -X POST localhost:8080/v1/migrations/$ID/resume       # wait for VERIFYING/succeeded
 curl -s -X POST localhost:8080/v1/migrations/$ID/finalize
+```
+
+Or with the common actions, as the orchestrator does:
+
+```sh
+REV=$(curl -s localhost:8080/v1/migrations/$ID | jq .revision)
+curl -si -X POST localhost:8080/v1/migrations/$ID/actions -H 'Idempotency-Key: q-1' \
+  -d "{\"action\":\"QUIESCE\",\"expectedRevision\":$REV,\"transitionId\":\"tx-1\"}"   # Location: /v1/operations/...
 ```
 
 Simulate app servers during a migration with `appsim`: it writes, reads each other's objects and deletes through the app storage module, counts every failed request, and writes the keys it left and deleted to compare with the buckets. It reports request times per migration step (the route each app held when it sent the request) and the longest time an app went without a successful write, and logs every request to `requests.csv` in `-out`. With `-direct` it sends the same requests straight to one bucket, without a migration, as a baseline.

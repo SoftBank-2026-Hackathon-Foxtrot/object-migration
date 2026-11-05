@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -139,4 +140,87 @@ func TestMigrationFlowOverHTTP(t *testing.T) {
 
 	// Nothing is allowed after completion.
 	c.expect(c.call(http.MethodPost, "/v1/migrations/"+id+"/rollback", ""), http.StatusConflict)
+}
+
+// TestActionFlowOverHTTP drives a migration with the common API's actions
+// and follows each one through GET /v1/operations/{id}.
+func TestActionFlowOverHTTP(t *testing.T) {
+	st := store.NewMemory()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	w := worker.New(st, engine.NewFake(2*time.Millisecond), worker.Config{PollInterval: 5 * time.Millisecond, RetryBackoff: 5 * time.Millisecond}, log)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { _ = w.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	srv := httptest.NewServer(api.NewHandler(api.Deps{Store: st, Notifier: w, Engine: "fake", Logger: log, Token: "t"}))
+	t.Cleanup(srv.Close)
+	c := client{t: t, url: srv.URL}
+	auth := []string{"Authorization", "Bearer t"}
+	get := func(path string) map[string]any {
+		return c.expect(c.call(http.MethodGet, path, "", auth...), http.StatusOK).body
+	}
+
+	created := c.expect(c.call(http.MethodPost, "/v1/migrations",
+		`{"source":{"kind":"s3","bucket":"foxtrot-src","region":"ap-northeast-2","ref":"env:AWS"},"target":{"kind":"gcs","bucket":"foxtrot-dst","ref":"env:GCP"}}`,
+		auth...), http.StatusAccepted)
+	id := created.body["id"].(string)
+
+	waitLifecycle := func(want string) map[string]any {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		var last map[string]any
+		for time.Now().Before(deadline) {
+			last = get("/v1/migrations/" + id)
+			if last["lifecycle"] == want && last["activeOperationId"] == nil {
+				return last
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s, last lifecycle=%v phase=%v", want, last["lifecycle"], last["phase"])
+		return nil
+	}
+	act := func(action, extra string) {
+		t.Helper()
+		rev := get("/v1/migrations/" + id)["revision"].(float64)
+		body := fmt.Sprintf(`{"action":%q,"expectedRevision":%d%s}`, action, int(rev), extra)
+		r := c.expect(c.call(http.MethodPost, "/v1/migrations/"+id+"/actions", body,
+			append([]string{"Idempotency-Key", "k-" + action}, auth...)...), http.StatusAccepted)
+		opURL := r.header.Get("Location")
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			op := get(opURL)
+			if op["status"] == "SUCCEEDED" {
+				return
+			}
+			if op["status"] == "FAILED" || op["status"] == "UNKNOWN" {
+				t.Fatalf("%s: %v", action, op)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("%s did not finish", action)
+	}
+
+	waitLifecycle("READY")
+	tx := `,"transitionId":"tx-1","quiesceRef":"q-1"`
+	act("QUIESCE", tx)
+	waitLifecycle("QUIESCED")
+	act("CUTOVER", tx)
+	waitLifecycle("SWITCHED")
+	act("RESUME", tx+`,"expectedLocation":"TARGET"`)
+	waitLifecycle("ACTIVE")
+	// FINALIZE is offered once verification passes.
+	deadline := time.Now().Add(5 * time.Second)
+	for fmt.Sprint(get("/v1/migrations/" + id)["allowedActions"]) != "[ROLLBACK FINALIZE]" {
+		if time.Now().After(deadline) {
+			t.Fatal("FINALIZE never offered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	act("FINALIZE", "")
+	final := waitLifecycle("COMPLETED")
+	ops, _ := final["operations"].([]any)
+	if len(ops) != 4 {
+		t.Fatalf("operations = %v", ops)
+	}
 }

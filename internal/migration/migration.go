@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -156,8 +157,50 @@ type CommandRequest struct {
 	DeadlineMS     int64   `json:"deadlineMs,omitempty"`
 	// ExpectedVersion, when set, must match the migration's version. It stops
 	// a client from acting on a state it has not seen.
-	ExpectedVersion int64     `json:"expectedVersion,omitempty"`
-	RequestedAt     time.Time `json:"requestedAt"`
+	ExpectedVersion int64 `json:"expectedVersion,omitempty"`
+	// ExpectedRevision, when set, must match the migration's revision. The
+	// revision moves less often than the version, so an orchestrator can
+	// act on a status it read a while ago.
+	ExpectedRevision int64 `json:"expectedRevision,omitempty"`
+	// QuiesceRef is the orchestrator's record that app writes were paused.
+	// Object storage does not need a pause; it is kept on the operation
+	// only so the orchestrator can trace it.
+	QuiesceRef  string    `json:"quiesceRef,omitempty"`
+	RequestedAt time.Time `json:"requestedAt"`
+}
+
+// OperationStatus is how far one accepted command got.
+type OperationStatus string
+
+const (
+	OperationQueued    OperationStatus = "QUEUED"
+	OperationRunning   OperationStatus = "RUNNING"
+	OperationSucceeded OperationStatus = "SUCCEEDED"
+	OperationFailed    OperationStatus = "FAILED"
+	// OperationUnknown means the command may or may not have taken effect.
+	OperationUnknown OperationStatus = "UNKNOWN"
+)
+
+// Operation is one accepted command and its outcome.
+type Operation struct {
+	ID           string          `json:"operationId"`
+	Command      Command         `json:"command"`
+	TransitionID string          `json:"transitionId,omitempty"`
+	QuiesceRef   string          `json:"quiesceRef,omitempty"`
+	Status       OperationStatus `json:"status"`
+	Message      string          `json:"message,omitempty"`
+	RequestedAt  time.Time       `json:"requestedAt"`
+	FinishedAt   *time.Time      `json:"finishedAt,omitempty"`
+}
+
+// doneIn is the phase in which each command has finished.
+var doneIn = map[Command]Phase{
+	CommandFreeze:   PhaseFrozen,
+	CommandSwitch:   PhaseSwitched,
+	CommandResume:   PhaseResumed,
+	CommandRollback: PhaseRolledBack,
+	CommandFinalize: PhaseCompleted,
+	CommandAbort:    PhaseAborted,
 }
 
 type Progress struct {
@@ -271,9 +314,16 @@ type Migration struct {
 	LastError *Error          `json:"lastError"`
 	// Version increases on every write so concurrent writers can detect
 	// conflicts.
-	Version   int64     `json:"version"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	Version int64 `json:"version"`
+	// Revision increases only when the phase changes or a command is
+	// accepted, not on progress updates.
+	Revision int64 `json:"revision"`
+	// Operations lists every accepted command, oldest first.
+	Operations []Operation `json:"operations,omitempty"`
+	// ActiveOperation is the operation still running, if any.
+	ActiveOperation string    `json:"activeOperationId,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
 }
 
 var (
@@ -302,12 +352,13 @@ func New(source, target Endpoint, now time.Time) (Migration, error) {
 		return Migration{}, errors.New("source and target are the same bucket")
 	}
 	return Migration{
-		ID:     newID(),
-		Type:   Type,
-		Phase:  PhaseCreated,
-		State:  StateWaiting,
-		Source: source,
-		Target: target,
+		ID:       newID(),
+		Type:     Type,
+		Phase:    PhaseCreated,
+		Revision: 1,
+		State:    StateWaiting,
+		Source:   source,
+		Target:   target,
 		Replication: Replication{
 			Forward: Flow{State: FlowNotStarted},
 			Reverse: Flow{State: FlowOff},
@@ -327,6 +378,7 @@ func New(source, target Endpoint, now time.Time) (Migration, error) {
 // RequestCommand records req as pending. Repeating the pending command with
 // the same idempotency key is a no-op.
 func (m *Migration) RequestCommand(req CommandRequest) error {
+	replacing := false
 	if m.Pending != nil {
 		if m.Pending.Command == req.Command && m.Pending.IdempotencyKey == req.IdempotencyKey {
 			return nil
@@ -339,9 +391,13 @@ func (m *Migration) RequestCommand(req CommandRequest) error {
 		if !stuck || req.Command != CommandRollback {
 			return fmt.Errorf("%w: %s", ErrCommandPending, m.Pending.Command)
 		}
+		replacing = true
 	}
 	if req.ExpectedVersion != 0 && req.ExpectedVersion != m.Version {
 		return fmt.Errorf("%w: expected %d, current %d", ErrVersionMismatch, req.ExpectedVersion, m.Version)
+	}
+	if req.ExpectedRevision != 0 && req.ExpectedRevision != m.Revision {
+		return fmt.Errorf("%w: expected revision %d, current %d", ErrVersionMismatch, req.ExpectedRevision, m.Revision)
 	}
 	phases, ok := allowedIn[req.Command]
 	if !ok {
@@ -356,9 +412,53 @@ func (m *Migration) RequestCommand(req CommandRequest) error {
 	if req.Command == CommandFinalize && m.Readiness.Advance.Result != ResultPass {
 		return fmt.Errorf("%w: verification is %s", ErrPrecondition, m.Readiness.Advance.Result)
 	}
+	if replacing {
+		m.finishOperation(OperationFailed, "replaced by rollback", req.RequestedAt)
+	}
 	r := req
 	m.Pending = &r
+	m.Revision++
+	op := Operation{
+		ID:           fmt.Sprintf("%s-op%d", m.ID, len(m.Operations)+1),
+		Command:      req.Command,
+		TransitionID: req.CutoverID,
+		QuiesceRef:   req.QuiesceRef,
+		Status:       OperationQueued,
+		RequestedAt:  req.RequestedAt,
+	}
+	m.Operations = append(m.Operations, op)
+	m.ActiveOperation = op.ID
 	return nil
+}
+
+// finishOperation records the outcome of the active operation.
+func (m *Migration) finishOperation(status OperationStatus, msg string, at time.Time) {
+	for i := range m.Operations {
+		if m.Operations[i].ID == m.ActiveOperation {
+			t := at
+			m.Operations[i].Status, m.Operations[i].Message, m.Operations[i].FinishedAt = status, msg, &t
+		}
+	}
+	m.ActiveOperation = ""
+}
+
+// Operation returns the operation with the given ID.
+func (m Migration) Operation(id string) (Operation, bool) {
+	for _, op := range m.Operations {
+		if op.ID == id {
+			return op, true
+		}
+	}
+	return Operation{}, false
+}
+
+// OperationMigrationID returns the migration an operation ID belongs to.
+func OperationMigrationID(opID string) (string, bool) {
+	i := strings.LastIndex(opID, "-op")
+	if i <= 0 {
+		return "", false
+	}
+	return opID[:i], true
 }
 
 // AllowedCommands lists the commands RequestCommand would accept right now.
@@ -384,6 +484,21 @@ func (m *Migration) TransitionTo(to Phase, now time.Time) error {
 	m.Phase = to
 	m.Detail = ""
 	m.UpdatedAt = now
+	m.Revision++
+	if m.ActiveOperation != "" {
+		if op, ok := m.Operation(m.ActiveOperation); ok {
+			switch {
+			case doneIn[op.Command] == to:
+				m.finishOperation(OperationSucceeded, "", now)
+			case to == PhaseFailed:
+				msg := ""
+				if m.LastError != nil {
+					msg = m.LastError.Message
+				}
+				m.finishOperation(OperationFailed, msg, now)
+			}
+		}
+	}
 	if to.Terminal() {
 		m.Pending = nil
 	}
@@ -399,6 +514,7 @@ func (m Migration) Clone() Migration {
 	c.Readiness.Rollback.Checks = slices.Clone(m.Readiness.Rollback.Checks)
 	c.Routing.Read = slices.Clone(m.Routing.Read)
 	c.Routing.Delete = slices.Clone(m.Routing.Delete)
+	c.Operations = slices.Clone(m.Operations)
 	if m.Pending != nil {
 		p := *m.Pending
 		c.Pending = &p

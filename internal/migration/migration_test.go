@@ -316,3 +316,58 @@ func TestRollbackDoesNotReplaceAStuckFinalize(t *testing.T) {
 		t.Fatalf("rollback over a stuck finalize: %v, want pending", err)
 	}
 }
+
+func TestOperationsFollowCommands(t *testing.T) {
+	m := newMigration(t)
+	m.Phase = PhaseFrozen
+	rev := m.Revision
+	if err := m.RequestCommand(CommandRequest{Command: CommandSwitch, CutoverID: "tx-1", ExpectedRevision: rev + 5}); !errors.Is(err, ErrVersionMismatch) {
+		t.Fatalf("stale revision: %v", err)
+	}
+	if err := m.RequestCommand(CommandRequest{Command: CommandSwitch, CutoverID: "tx-1", ExpectedRevision: rev}); err != nil {
+		t.Fatal(err)
+	}
+	if m.Revision != rev+1 || m.ActiveOperation != m.ID+"-op1" {
+		t.Fatalf("revision %d, active %q", m.Revision, m.ActiveOperation)
+	}
+	// A stuck switch replaced by rollback fails; the rollback runs on
+	// through ROLLING_BACK and succeeds at ROLLED_BACK.
+	m.State = StateUnknown
+	if err := m.RequestCommand(CommandRequest{Command: CommandRollback, RequestedAt: t0}); err != nil {
+		t.Fatal(err)
+	}
+	if op, _ := m.Operation(m.ID + "-op1"); op.Status != OperationFailed || op.FinishedAt == nil {
+		t.Fatalf("replaced switch = %+v", op)
+	}
+	m.Pending = nil
+	if err := m.TransitionTo(PhaseRollingBack, t0); err != nil {
+		t.Fatal(err)
+	}
+	if op, _ := m.Operation(m.ID + "-op2"); op.Status != OperationQueued || m.ActiveOperation != op.ID {
+		t.Fatalf("rollback while rolling back = %+v", op)
+	}
+	if err := m.TransitionTo(PhaseRolledBack, t0); err != nil {
+		t.Fatal(err)
+	}
+	if op, _ := m.Operation(m.ID + "-op2"); op.Status != OperationSucceeded || m.ActiveOperation != "" {
+		t.Fatalf("rollback after rolled back = %+v", op)
+	}
+	if id, ok := OperationMigrationID(m.ID + "-op2"); !ok || id != m.ID {
+		t.Fatalf("OperationMigrationID = %q %v", id, ok)
+	}
+}
+
+func TestFailureFailsTheActiveOperation(t *testing.T) {
+	m := newMigration(t)
+	m.Phase = PhaseReady
+	if err := m.RequestCommand(CommandRequest{Command: CommandFreeze}); err != nil {
+		t.Fatal(err)
+	}
+	m.LastError = &Error{Code: "X", Message: "bucket gone"}
+	if err := m.TransitionTo(PhaseFailed, t0); err != nil {
+		t.Fatal(err)
+	}
+	if op, _ := m.Operation(m.ID + "-op1"); op.Status != OperationFailed || op.Message != "bucket gone" {
+		t.Fatalf("operation = %+v", op)
+	}
+}

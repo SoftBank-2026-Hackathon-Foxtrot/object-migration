@@ -324,8 +324,12 @@ func TestStatusShowsAllowedActionsAndReplication(t *testing.T) {
 
 	body := decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))
 	allowed, _ := json.Marshal(body["allowedActions"])
-	if string(allowed) != `["freeze","abort"]` {
-		t.Fatalf("allowedActions = %s", allowed)
+	cmds, _ := json.Marshal(body["allowedCommands"])
+	if string(allowed) != `["QUIESCE","CANCEL"]` || string(cmds) != `["freeze","abort"]` {
+		t.Fatalf("allowedActions = %s, allowedCommands = %s", allowed, cmds)
+	}
+	if body["lifecycle"] != "READY" || body["health"] != "OK" || body["kind"] != "OBJECT_STORAGE" {
+		t.Fatalf("lifecycle = %v, health = %v, kind = %v", body["lifecycle"], body["health"], body["kind"])
 	}
 	repl, _ := body["replication"].(map[string]any)
 	forward, _ := repl["forward"].(map[string]any)
@@ -354,5 +358,62 @@ func TestStaleExpectedVersionIsConflict(t *testing.T) {
 	ok := `{"expectedVersion":` + strconv.Itoa(current) + `}`
 	if rec := do(t, h, http.MethodPost, "/v1/migrations/"+id+"/freeze", ok); rec.Code != http.StatusAccepted {
 		t.Fatalf("current version: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestActionsCheckTheirFields(t *testing.T) {
+	h, _, st := newTestHandlerWithStore()
+	id := decodeBody(t, do(t, h, http.MethodPost, "/v1/migrations", validBody))["id"].(string)
+	setState(t, st, id, func(m *migration.Migration) { m.Phase = migration.PhaseReady })
+	rev := strconv.Itoa(int(decodeBody(t, do(t, h, http.MethodGet, "/v1/migrations/"+id, ""))["revision"].(float64)))
+	path := "/v1/migrations/" + id + "/actions"
+
+	for _, c := range []struct{ body, code string }{
+		{`{"action":"START_SYNC","expectedRevision":` + rev + `}`, "UNSUPPORTED_ACTION"},
+		{`{"action":"RECONCILE","expectedRevision":` + rev + `}`, "UNSUPPORTED_ACTION"},
+		{`{"action":"JUMP","expectedRevision":` + rev + `}`, "INVALID_ARGUMENT"},
+		{`{"action":"QUIESCE","transitionId":"tx-1"}`, "INVALID_ARGUMENT"},
+		{`{"action":"QUIESCE","expectedRevision":` + rev + `}`, "INVALID_ARGUMENT"},
+		{`{"action":"RESUME","expectedRevision":` + rev + `,"transitionId":"tx-1","expectedLocation":"SOURCE"}`, "INVALID_ARGUMENT"},
+	} {
+		wantError(t, do(t, h, http.MethodPost, path, c.body), http.StatusBadRequest, c.code)
+	}
+	wantError(t, do(t, h, http.MethodPost, path, `{"action":"QUIESCE","expectedRevision":999,"transitionId":"tx-1"}`), http.StatusConflict, "VERSION_CONFLICT")
+	wantError(t, do(t, h, http.MethodPost, path, `{"action":"CUTOVER","expectedRevision":`+rev+`,"transitionId":"tx-1"}`), http.StatusConflict, "INVALID_PHASE")
+
+	// Progress updates change the version but not the revision.
+	setState(t, st, id, func(m *migration.Migration) { m.Replication.Forward.Backlog = 3 })
+	rec := do(t, h, http.MethodPost, path, `{"action":"QUIESCE","expectedRevision":`+rev+`,"transitionId":"tx-1","quiesceRef":"q-1"}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("quiesce: %d %s", rec.Code, rec.Body)
+	}
+	body := decodeBody(t, rec)
+	opID, _ := body["operationId"].(string)
+	if body["status"] != "QUEUED" || rec.Header().Get("Location") != "/v1/operations/"+opID || body["statusUrl"] != "/v1/operations/"+opID {
+		t.Fatalf("accepted = %v, Location %q", body, rec.Header().Get("Location"))
+	}
+	op := decodeBody(t, do(t, h, http.MethodGet, "/v1/operations/"+opID, ""))
+	if op["status"] != "RUNNING" || op["action"] != "QUIESCE" || op["transitionId"] != "tx-1" || op["quiesceRef"] != "q-1" || op["migrationId"] != id {
+		t.Fatalf("operation = %v", op)
+	}
+	wantError(t, do(t, h, http.MethodGet, "/v1/operations/"+id+"-op9", ""), http.StatusNotFound, "NOT_FOUND")
+	wantError(t, do(t, h, http.MethodGet, "/v1/operations/nope", ""), http.StatusNotFound, "NOT_FOUND")
+}
+
+func TestTokenGuardsControlRoutesOnly(t *testing.T) {
+	st := store.NewMemory()
+	h := NewHandler(Deps{Store: st, Engine: "fake", Token: "s3cret"})
+	wantError(t, do(t, h, http.MethodPost, "/v1/migrations", validBody), http.StatusUnauthorized, "UNAUTHENTICATED")
+	wantError(t, do(t, h, http.MethodGet, "/v1/capabilities", "", "Authorization", "Bearer wrong"), http.StatusUnauthorized, "UNAUTHENTICATED")
+	rec := do(t, h, http.MethodPost, "/v1/migrations", validBody, "Authorization", "Bearer s3cret")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("with token: %d %s", rec.Code, rec.Body)
+	}
+	id := decodeBody(t, rec)["id"].(string)
+	if rec := do(t, h, http.MethodGet, "/v1/migrations/"+id+"/routing", ""); rec.Code != http.StatusOK {
+		t.Fatalf("routing without token: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do(t, h, http.MethodGet, "/healthz", ""); rec.Code != http.StatusOK {
+		t.Fatalf("healthz without token: %d", rec.Code)
 	}
 }
