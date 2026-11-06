@@ -142,7 +142,7 @@ ENGINE=fake FAKE_STEP_DELAY=500ms go run ./cmd/object-migration
 | `DYNAMODB_TABLE` | | DynamoDB table for the server's state, created with on-demand capacity if missing. Reached with the platform's AWS credentials (the SDK's default chain, e.g. `AWS_PROFILE`). Unset: state lives in memory and is lost on restart |
 | `DYNAMODB_REGION` | `ap-northeast-2` | Region of `DYNAMODB_TABLE` |
 | `API_TOKEN` | | Bearer token the orchestrator must send. Unset: control routes are open (logged as a warning) |
-| `OBJECT_RESOURCES` | | JSON file of the buckets a plan may name: `{"aws-receipts": {"kind": "s3", "bucket": "...", "region": "ap-northeast-2", "ref": "default"}, ...}` |
+| `OBJECT_RESOURCES` | | Buckets a plan may name, as a JSON file path or inline JSON (handy for containers): `{"aws-receipts": {"kind": "s3", "bucket": "...", "region": "ap-northeast-2", "ref": "default"}, ...}` |
 | `DYNAMODB_ENDPOINT` | | Endpoint override, e.g. DynamoDB Local |
 | `ENGINE` | `rclone` | `rclone` copies real objects; `fake` only pretends |
 | `POLL_INTERVAL` | `2s` | How often a waiting migration rechecks, and the retry backoff |
