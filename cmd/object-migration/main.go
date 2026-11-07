@@ -249,6 +249,7 @@ func newEngine(logger *slog.Logger) (engine.Engine, time.Duration, error) {
 		eng := engine.NewRclone(copier.Options{Transfers: transfers, Checkers: checkers})
 		eng.Log = logger
 		eng.GCPProject = os.Getenv("GCP_PROJECT")
+		eng.GCPCredentials = os.Getenv("GCP_CREDENTIALS")
 		if eng.Stream.FullCopyInterval, err = durationEnv("FULL_COPY_INTERVAL", eng.Stream.FullCopyInterval); err != nil {
 			return nil, 0, err
 		}
