@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -82,7 +84,10 @@ func GCSOptions(ref string) ([]option.ClientOption, error) {
 
 // GCSFile resolves a reference for gcs. "default" returns "", meaning
 // Application Default Credentials. "env:NAME" reads NAME_CREDENTIALS_FILE,
-// the path of a service account key file.
+// the path of a service account key file, or else NAME_CREDENTIALS_JSON, the
+// key itself (for containers that get secrets as environment variables and
+// have no shell to write them out). The JSON is written once to a file only
+// this process's user can read, and that path is returned.
 func GCSFile(ref string) (string, error) {
 	if ref == Default {
 		return "", nil
@@ -91,11 +96,31 @@ func GCSFile(ref string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	file := os.Getenv(name + "_CREDENTIALS_FILE")
-	if file == "" {
-		return "", fmt.Errorf("%w: %s_CREDENTIALS_FILE must be set", ErrBadRef, name)
+	if file := os.Getenv(name + "_CREDENTIALS_FILE"); file != "" {
+		return file, nil
 	}
-	return file, nil
+	if key := os.Getenv(name + "_CREDENTIALS_JSON"); key != "" {
+		return keyFile(name, key)
+	}
+	return "", fmt.Errorf("%w: %s_CREDENTIALS_FILE or %s_CREDENTIALS_JSON must be set", ErrBadRef, name, name)
+}
+
+var keyFiles sync.Map // name -> path of the key written from NAME_CREDENTIALS_JSON
+
+func keyFile(name, key string) (string, error) {
+	if path, ok := keyFiles.Load(name); ok {
+		return path.(string), nil
+	}
+	dir, err := os.MkdirTemp("", "gcs-key-")
+	if err != nil {
+		return "", fmt.Errorf("write %s_CREDENTIALS_JSON: %w", name, err)
+	}
+	path := filepath.Join(dir, strings.ToLower(name)+".json")
+	if err := os.WriteFile(path, []byte(key), 0o600); err != nil {
+		return "", fmt.Errorf("write %s_CREDENTIALS_JSON: %w", name, err)
+	}
+	actual, _ := keyFiles.LoadOrStore(name, path)
+	return actual.(string), nil
 }
 
 func envRef(ref string) (string, error) {

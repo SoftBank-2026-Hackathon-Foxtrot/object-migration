@@ -114,7 +114,7 @@ Each endpoint's `ref` says where the server finds its credentials. Requests neve
 | `ref` | s3, seaweedfs | gcs |
 | --- | --- | --- |
 | `default` | AWS SDK default chain (`AWS_PROFILE`, instance role, ...) | Application Default Credentials |
-| `env:NAME` | `NAME_ACCESS_KEY_ID`, `NAME_SECRET_ACCESS_KEY`, optional `NAME_SESSION_TOKEN` | `NAME_CREDENTIALS_FILE`, a service account key file |
+| `env:NAME` | `NAME_ACCESS_KEY_ID`, `NAME_SECRET_ACCESS_KEY`, optional `NAME_SESSION_TOKEN` | `NAME_CREDENTIALS_FILE`, a service account key file, or `NAME_CREDENTIALS_JSON`, the key itself (written once to a file only the server can read) |
 
 s3 endpoints also need `region`.
 
