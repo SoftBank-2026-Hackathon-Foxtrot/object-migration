@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -300,9 +301,13 @@ func loadResources(path string) (map[string]migration.Endpoint, error) {
 	if path == "" {
 		return nil, nil
 	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("OBJECT_RESOURCES: %w", err)
+	// Inline JSON (a container environment variable) or a path to a JSON file.
+	b := []byte(path)
+	if !strings.HasPrefix(strings.TrimSpace(path), "{") {
+		var err error
+		if b, err = os.ReadFile(path); err != nil {
+			return nil, fmt.Errorf("OBJECT_RESOURCES: %w", err)
+		}
 	}
 	var out map[string]migration.Endpoint
 	if err := json.Unmarshal(b, &out); err != nil {
