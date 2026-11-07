@@ -13,6 +13,7 @@ import (
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/routing"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/telemetry"
 )
 
 // This file serves the team's common migration API (draft 0.2, the
@@ -236,6 +237,7 @@ func (h *handler) action(w http.ResponseWriter, r *http.Request) {
 		op, err = h.finalizeRestored(r.Context(), m.ID, *body.ExpectedRevision)
 	default:
 		m, err = h.Store.RequestCommand(r.Context(), m.ID, migration.CommandRequest{
+			TraceContext:     telemetry.Headers(r.Context()),
 			Command:          actionCommands[body.Action],
 			IdempotencyKey:   r.Header.Get(idempotencyHeader),
 			CutoverID:        body.TransitionID,
@@ -348,6 +350,9 @@ func (h *handler) mutate(ctx context.Context, id string, fn func(*migration.Migr
 			return migration.Migration{}, err
 		}
 		m, err = h.Store.Update(ctx, m)
+		if err == nil && h.Observe != nil {
+			h.Observe(ctx, m)
+		}
 		if !errors.Is(err, store.ErrConflict) {
 			return m, err
 		}

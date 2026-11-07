@@ -165,10 +165,11 @@ var commandOrder = []Command{
 
 // CommandRequest is a command waiting for the worker.
 type CommandRequest struct {
-	Command        Command `json:"command"`
-	IdempotencyKey string  `json:"idempotencyKey,omitempty"`
-	CutoverID      string  `json:"cutoverId,omitempty"`
-	DeadlineMS     int64   `json:"deadlineMs,omitempty"`
+	TraceContext   map[string]string `json:"traceContext,omitempty"`
+	Command        Command           `json:"command"`
+	IdempotencyKey string            `json:"idempotencyKey,omitempty"`
+	CutoverID      string            `json:"cutoverId,omitempty"`
+	DeadlineMS     int64             `json:"deadlineMs,omitempty"`
 	// ExpectedVersion, when set, must match the migration's version. It stops
 	// a client from acting on a state it has not seen.
 	ExpectedVersion int64 `json:"expectedVersion,omitempty"`

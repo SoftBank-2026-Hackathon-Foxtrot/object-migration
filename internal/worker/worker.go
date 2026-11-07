@@ -17,9 +17,12 @@ import (
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/routing"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/telemetry"
 )
 
 type Config struct {
+	Telemetry *telemetry.Telemetry
+	Observe   func(context.Context, migration.Migration)
 	// PollInterval is how often a migration rechecks its state while it
 	// waits, and how often the worker looks for migrations it is not running.
 	PollInterval time.Duration
@@ -235,7 +238,22 @@ func (w *Worker) loop(ctx context.Context, id string, wake <-chan struct{}) {
 }
 
 // step does one unit of work and returns how long to wait before the next.
-func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration, error) {
+func (w *Worker) step(ctx context.Context, m migration.Migration) (wait time.Duration, err error) {
+	if w.cfg.Telemetry != nil && m.Plan != nil {
+		action := string(m.Phase)
+		var parent map[string]string
+		if m.Pending != nil {
+			action = string(m.Pending.Command)
+			parent = m.Pending.TraceContext
+		}
+		var end func(error)
+		ctx, end = w.cfg.Telemetry.Operation(ctx, m.Plan.WorkflowID, m.ID, m.ActiveOperation, action, parent)
+		defer func() { end(err) }()
+	}
+	return w.stepWork(ctx, m)
+}
+
+func (w *Worker) stepWork(ctx context.Context, m migration.Migration) (time.Duration, error) {
 	if m.Pending != nil {
 		return 0, w.runCommand(ctx, m)
 	}
@@ -701,8 +719,12 @@ func (w *Worker) mutate(ctx context.Context, id string, fn func(*migration.Migra
 			return err
 		}
 		m.UpdatedAt = w.now()
-		_, err = w.store.Update(ctx, m)
+		saved, updateErr := w.store.Update(ctx, m)
+		err = updateErr
 		if err == nil {
+			if w.cfg.Observe != nil {
+				w.cfg.Observe(ctx, saved)
+			}
 			return nil
 		}
 		if !errors.Is(err, store.ErrConflict) {

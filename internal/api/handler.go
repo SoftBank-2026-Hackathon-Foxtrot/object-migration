@@ -32,6 +32,7 @@ type Preflighter interface {
 }
 
 type Deps struct {
+	Observe  func(context.Context, migration.Migration)
 	Store    store.Store
 	Notifier Notifier
 	// Engine is the engine name reported by /v1/capabilities.
