@@ -258,6 +258,12 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 		defer done()
 		report := func(p migration.Progress) {
 			err := w.mutate(ctx, m.ID, func(x *migration.Migration) error {
+				if p.Completed > x.Replication.InitialCopy.Completed || p.Bytes > x.Replication.InitialCopy.Bytes {
+					at := w.now().UTC()
+					x.LastProgressAt = &at
+				}
+				at := w.now().UTC()
+				x.InitialCopyObservedAt = &at
 				x.Replication.InitialCopy = p
 				return nil
 			})
@@ -295,6 +301,12 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 			if x.Phase != migration.PhaseSyncing && x.Phase != migration.PhaseReady {
 				return nil // a command moved it on while we synced
 			}
+			at := w.now().UTC()
+			x.LastSuccessfulSyncAt, x.LastVerificationAt = &at, &at
+			x.ForwardObservedAt = &at
+			if report.Backlog < x.Replication.Forward.Backlog {
+				x.LastProgressAt = &at
+			}
 			x.Readiness.Cutover, x.LastError = report.Cutover, nil
 			x.Replication.Forward.Backlog = report.Backlog
 			x.Replication.Forward.LagSeconds = report.LagSeconds
@@ -328,6 +340,12 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 		err = w.mutate(ctx, m.ID, func(x *migration.Migration) error {
 			if x.Phase != migration.PhaseVerifying {
 				return nil
+			}
+			at := w.now().UTC()
+			x.LastSuccessfulSyncAt, x.LastVerificationAt = &at, &at
+			x.ReverseObservedAt = &at
+			if report.ReverseBacklog < x.Replication.Reverse.Backlog {
+				x.LastProgressAt = &at
 			}
 			x.Readiness.Advance, x.Readiness.Rollback, x.LastError = report.Advance, report.Rollback, nil
 			x.Replication.Reverse.Backlog = report.ReverseBacklog

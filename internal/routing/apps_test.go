@@ -93,3 +93,21 @@ func TestWaitingAfterStart(t *testing.T) {
 		t.Fatalf("waiting after one TTL = %v", got)
 	}
 }
+
+func TestSnapshotSeparatesLiveFromApplied(t *testing.T) {
+	a := NewApps(time.Second)
+	now := time.Unix(1000, 0)
+	a.now = func() time.Time { return now }
+	a.started = now
+	a.Report("m", "one", 1)
+	a.Report("m", "two", 2)
+	got := a.Snapshot("m", 2)
+	if got.Live != 2 || got.Acked != 1 || got.Waiting != 1 || !got.Recovering || got.OldestReportAt == nil {
+		t.Fatalf("snapshot = %+v", got)
+	}
+	now = now.Add(2 * time.Second)
+	got = a.Snapshot("m", 2)
+	if got.Live != 0 || got.Acked != 0 || got.OldestReportAt != nil || got.Recovering {
+		t.Fatalf("expired = %+v", got)
+	}
+}

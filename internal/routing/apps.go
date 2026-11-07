@@ -106,3 +106,37 @@ func (a *Apps) Forget(migration string) {
 	defer a.mu.Unlock()
 	delete(a.seen, migration)
 }
+
+// Snapshot is one atomic view of live reports. Expected membership is configured by the controller.
+type Snapshot struct {
+	Generation     int64      `json:"generation"`
+	Live           int        `json:"live"`
+	Acked          int        `json:"acked"`
+	Waiting        int        `json:"waiting"`
+	Recovering     bool       `json:"recovering"`
+	OldestReportAt *time.Time `json:"oldestReportAt"`
+	ObservedAt     time.Time  `json:"observedAt"`
+}
+
+func (a *Apps) Snapshot(migration string, generation int64) Snapshot {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := a.now()
+	out := Snapshot{Generation: generation, ObservedAt: now, Recovering: now.Sub(a.started) <= a.ttl}
+	for _, r := range a.seen[migration] {
+		if now.Sub(r.at) > a.ttl {
+			continue
+		}
+		out.Live++
+		if r.applied >= generation {
+			out.Acked++
+		} else {
+			out.Waiting++
+		}
+		if out.OldestReportAt == nil || r.at.Before(*out.OldestReportAt) {
+			at := r.at
+			out.OldestReportAt = &at
+		}
+	}
+	return out
+}

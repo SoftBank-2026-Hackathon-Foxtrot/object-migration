@@ -585,9 +585,10 @@ func (r *Rclone) Verify(ctx context.Context, m migration.Migration) (VerifyRepor
 	}
 	return VerifyReport{
 		Advance: migration.Decide(migration.Check{
-			Name:    "target_has_source",
-			OK:      d.Missing == 0 && d.Differ == 0,
-			Message: fmt.Sprintf("%d source objects missing from the target, %d different", d.Missing, d.Differ),
+			Name:         "target_has_source",
+			Verification: comparisonEvidence(d),
+			OK:           d.Missing == 0 && d.Differ == 0,
+			Message:      fmt.Sprintf("%d source objects missing from the target, %d different", d.Missing, d.Differ),
 		}),
 		// Rolling back copies the rest; what matters is that the reverse
 		// copy works.
@@ -606,9 +607,10 @@ func (r *Rclone) compare(ctx context.Context, src, dst fs.Fs) (migration.Check, 
 		return migration.Check{}, d, fmt.Errorf("check: %w", err)
 	}
 	return migration.Check{
-		Name:    "target_matches_source",
-		OK:      d.Same(),
-		Message: fmt.Sprintf("%d missing, %d different, %d only in target, %d identical", d.Missing, d.Differ, d.Extra, d.Matched),
+		Name:         "target_matches_source",
+		Verification: comparisonEvidence(d),
+		OK:           d.Same(),
+		Message:      fmt.Sprintf("%d missing, %d different, %d only in target, %d identical", d.Missing, d.Differ, d.Extra, d.Matched),
 	}, d, nil
 }
 
@@ -817,4 +819,9 @@ func (r *Rclone) Directions() []Direction {
 		}
 	}
 	return out
+}
+
+func comparisonEvidence(d copier.Diff) *migration.Verification {
+	return &migration.Verification{Method: "SIZE_AND_MD5_WHEN_AVAILABLE", Scope: "REGISTERED_BUCKETS",
+		Matched: d.Matched, Missing: d.Missing, Different: d.Differ, Extra: d.Extra}
 }

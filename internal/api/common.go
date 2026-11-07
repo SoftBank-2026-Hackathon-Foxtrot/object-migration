@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/routing"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
 )
 
@@ -651,8 +652,15 @@ type migrationView struct {
 }
 
 type objectDetail struct {
-	Readiness migration.Readiness `json:"readiness"`
-	AppsLive  int                 `json:"appsLive"`
+	Readiness             migration.Readiness `json:"readiness"`
+	Apps                  *routing.Snapshot   `json:"apps"`
+	InitialCopyObservedAt *time.Time          `json:"initialCopyObservedAt"`
+	ForwardObservedAt     *time.Time          `json:"forwardObservedAt"`
+	ReverseObservedAt     *time.Time          `json:"reverseObservedAt"`
+	LastSuccessfulSyncAt  *time.Time          `json:"lastSuccessfulSyncAt"`
+	LastVerificationAt    *time.Time          `json:"lastVerificationAt"`
+	LastProgressAt        *time.Time          `json:"lastProgressAt"`
+	AppsLive              int                 `json:"appsLive"`
 }
 
 func optional(s string) *string {
@@ -698,7 +706,7 @@ func (h *handler) view(m migration.Migration) migrationView {
 	if m.Routing.Write == migration.SideTarget {
 		access = "TARGET_ONLY"
 	}
-	v.Observed = observed{ObservedAt: now.Format(time.RFC3339), Route: rt, BusinessWriteAccess: access, TargetWritesPossible: m.TargetWritesPossible}
+	v.Observed = observed{ObservedAt: m.UpdatedAt.UTC().Format(time.RFC3339), Route: rt, BusinessWriteAccess: access, TargetWritesPossible: m.TargetWritesPossible}
 
 	if p := m.Replication.InitialCopy; p.Total > 0 || p.Completed > 0 {
 		c, t := p.Completed, p.Total
@@ -794,9 +802,12 @@ func (h *handler) view(m migration.Migration) migrationView {
 		v.Rollback = rollbackView{Method: "UNAVAILABLE", Reasons: rollback.Reasons}
 	}
 
-	d := objectDetail{Readiness: m.Readiness}
+	d := objectDetail{Readiness: m.Readiness, InitialCopyObservedAt: m.InitialCopyObservedAt,
+		ForwardObservedAt: m.ForwardObservedAt, ReverseObservedAt: m.ReverseObservedAt, LastSuccessfulSyncAt: m.LastSuccessfulSyncAt,
+		LastVerificationAt: m.LastVerificationAt, LastProgressAt: m.LastProgressAt}
 	if h.Apps != nil {
-		d.AppsLive = h.Apps.Live(m.ID)
+		snapshot := h.Apps.Snapshot(m.ID, m.Routing.Generation)
+		d.Apps, d.AppsLive = &snapshot, snapshot.Live
 	}
 	v.Details = map[string]objectDetail{"object": d}
 	return v
