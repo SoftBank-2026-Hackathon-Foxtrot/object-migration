@@ -148,6 +148,7 @@ ENGINE=fake FAKE_STEP_DELAY=500ms go run ./cmd/object-migration
 | `POLL_INTERVAL` | `2s` | How often a waiting migration rechecks, and the retry backoff |
 | `SYNC_INTERVAL` | `30s` (`2s` with fake) | Wait between sync rounds for sources without a change feed. Each such round lists both buckets |
 | `GCP_PROJECT` | | Platform project for the Pub/Sub topics that follow GCS sources. Unset: GCS sources are mirrored every round |
+| `GCP_CREDENTIALS` | `default` | Credentials reference for those Pub/Sub topics: `default` (Application Default Credentials) or `env:NAME` (`NAME_CREDENTIALS_FILE` or `NAME_CREDENTIALS_JSON`, as for a gcs endpoint). A container without ADC sets this, e.g. `env:GCS` |
 | `FULL_COPY_INTERVAL` | `5m` | How often a source with a change feed is copied in full again, in case an event was lost |
 | `COPY_TRANSFERS` | `16` | Objects copied at once |
 | `COPY_CHECKERS` | `16` | Objects compared at once |

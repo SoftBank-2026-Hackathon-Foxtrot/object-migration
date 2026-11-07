@@ -39,6 +39,11 @@ type Rclone struct {
 	// Pub/Sub topics that follow GCS sources. Empty means GCS sources have
 	// no change feed and are mirrored every round.
 	GCPProject string
+	// GCPCredentials is the credentials reference ("default" or "env:NAME",
+	// see package creds) the server uses for those Pub/Sub topics. Empty
+	// means "default": Application Default Credentials, which a container
+	// without a key file or metadata server does not have.
+	GCPCredentials string
 	// Deletes holds the keys apps deleted during each migration. Every copy
 	// honors them: a key an app deleted is removed from where it was copied,
 	// however the copy and the delete interleaved. Nil means apps record
@@ -171,6 +176,14 @@ func NewRclone(opt copier.Options) *Rclone {
 	return r
 }
 
+// pubsubRef is the credentials reference for the platform's Pub/Sub topics.
+func (r *Rclone) pubsubRef() string {
+	if r.GCPCredentials == "" {
+		return creds.Default
+	}
+	return r.GCPCredentials
+}
+
 func (r *Rclone) checkSourceFeed(ctx context.Context, source migration.Endpoint) error {
 	if source.Kind == migration.KindSeaweedFS && source.Filer != "" {
 		return eventsource.CheckSeaweedFS(ctx, source.Filer, source.Bucket)
@@ -178,6 +191,9 @@ func (r *Rclone) checkSourceFeed(ctx context.Context, source migration.Endpoint)
 	if source.Kind == migration.KindGCS {
 		if r.GCPProject == "" {
 			return nil
+		}
+		if _, err := creds.GCSOptions(r.pubsubRef()); err != nil {
+			return fmt.Errorf("GCP_CREDENTIALS: %w", err)
 		}
 		opts, err := creds.GCSOptions(source.Ref)
 		if err != nil {
@@ -221,7 +237,11 @@ func (r *Rclone) defaultFeed(ctx context.Context, m migration.Migration) (Feed, 
 		if err != nil {
 			return nil, err
 		}
-		ps, err := pubsub.NewService(ctx) // the platform's own credentials
+		psOpts, err := creds.GCSOptions(r.pubsubRef()) // the platform's own credentials
+		if err != nil {
+			return nil, err
+		}
+		ps, err := pubsub.NewService(ctx, psOpts...)
 		if err != nil {
 			return nil, err
 		}
