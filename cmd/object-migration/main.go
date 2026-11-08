@@ -26,7 +26,9 @@ import (
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/routing"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/telemetry"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/worker"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 func main() {
@@ -83,14 +85,50 @@ func run(logger *slog.Logger) error {
 		}
 		directions = r.Directions()
 	}
+	otel, telemetryErr := telemetry.New(context.Background())
+	if telemetryErr != nil {
+		logger.Warn("OTEL unavailable; migration continues")
+	}
+	defer func() {
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = otel.Close(c)
+	}()
+	observe := func(ctx context.Context, m migration.Migration) {
+		if m.Plan == nil {
+			return
+		}
+		otel.Snapshot(ctx, m.Plan.WorkflowID, api.Observation(m, apps))
+		attrs := []attribute.KeyValue{attribute.String("workflow.id", m.Plan.WorkflowID), attribute.String("resource.kind", "OBJECT_STORAGE")}
+		otel.Measure(ctx, "foxtrot.observation.age", time.Since(m.UpdatedAt).Seconds(), attrs...)
+		if m.InitialCopyObservedAt != nil && time.Since(*m.InitialCopyObservedAt) <= 15*time.Second {
+			otel.Measure(ctx, "foxtrot.migration.completed", float64(m.Replication.InitialCopy.Completed), attrs...)
+			otel.Measure(ctx, "foxtrot.migration.total", float64(m.Replication.InitialCopy.Total), attrs...)
+		}
+		for direction, observed := range map[string]*time.Time{"forward": m.ForwardObservedAt, "reverse": m.ReverseObservedAt} {
+			if observed == nil || time.Since(*observed) > 15*time.Second {
+				continue
+			}
+			flow := m.Replication.Forward
+			if direction == "reverse" {
+				flow = m.Replication.Reverse
+			}
+			labels := append(append([]attribute.KeyValue{}, attrs...), attribute.String("direction", direction))
+			otel.Measure(ctx, "foxtrot.replication.backlog", float64(flow.Backlog), labels...)
+			otel.Measure(ctx, "foxtrot.replication.lagseconds", flow.LagSeconds, labels...)
+		}
+
+	}
 	w := worker.New(st, eng, worker.Config{
+		Telemetry: otel, Observe: observe,
 		PollInterval: poll, RetryBackoff: poll, SyncInterval: syncInterval,
 		Apps: apps, ConfirmTimeout: confirm,
 	}, logger)
 
 	srv := &http.Server{
 		Addr: addr,
-		Handler: api.NewHandler(api.Deps{
+		Handler: otel.Handler(api.NewHandler(api.Deps{
+			Observe:    observe,
 			Store:      st,
 			Notifier:   w,
 			Engine:     eng.Name(),
@@ -101,12 +139,30 @@ func run(logger *slog.Logger) error {
 			Token:      os.Getenv("API_TOKEN"),
 			Resources:  resources,
 			Logger:     logger,
-		}),
+		})),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				list, err := st.ListActive(ctx)
+				if err != nil {
+					continue
+				}
+				for _, m := range list {
+					observe(ctx, m)
+				}
+			}
+		}
+	}()
 
 	workerDone := make(chan struct{})
 	go func() {

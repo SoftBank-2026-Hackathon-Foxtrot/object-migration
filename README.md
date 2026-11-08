@@ -225,3 +225,7 @@ OM_DYNAMODB_ENDPOINT=http://127.0.0.1:58000 go test -race ./internal/store
 | `internal/store` | Storage shared by the API and the worker: DynamoDB, or memory for tests and local runs |
 
 Not yet: metrics and server-to-server authentication (M8).
+
+## 마이그레이션 관측
+
+추가 필드와 연결 방법은 [관측 연결](docs/migration-observability.md)을 참고하세요.

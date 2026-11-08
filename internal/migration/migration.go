@@ -165,10 +165,11 @@ var commandOrder = []Command{
 
 // CommandRequest is a command waiting for the worker.
 type CommandRequest struct {
-	Command        Command `json:"command"`
-	IdempotencyKey string  `json:"idempotencyKey,omitempty"`
-	CutoverID      string  `json:"cutoverId,omitempty"`
-	DeadlineMS     int64   `json:"deadlineMs,omitempty"`
+	TraceContext   map[string]string `json:"traceContext,omitempty"`
+	Command        Command           `json:"command"`
+	IdempotencyKey string            `json:"idempotencyKey,omitempty"`
+	CutoverID      string            `json:"cutoverId,omitempty"`
+	DeadlineMS     int64             `json:"deadlineMs,omitempty"`
 	// ExpectedVersion, when set, must match the migration's version. It stops
 	// a client from acting on a state it has not seen.
 	ExpectedVersion int64 `json:"expectedVersion,omitempty"`
@@ -231,10 +232,21 @@ type Progress struct {
 	TotalBytes int64 `json:"totalBytes,omitempty"`
 }
 
+// Verification describes the comparison actually performed, not a claim of full content hashing.
+type Verification struct {
+	Method    string `json:"method"`
+	Scope     string `json:"scope"`
+	Matched   int64  `json:"matched"`
+	Missing   int64  `json:"missing"`
+	Different int64  `json:"different"`
+	Extra     int64  `json:"extra"`
+}
+
 type Check struct {
-	Name    string `json:"name"`
-	OK      bool   `json:"ok"`
-	Message string `json:"message,omitempty"`
+	Verification *Verification `json:"verification,omitempty"`
+	Name         string        `json:"name"`
+	OK           bool          `json:"ok"`
+	Message      string        `json:"message,omitempty"`
 }
 
 // Result is the outcome of a decision.
@@ -360,10 +372,16 @@ type Migration struct {
 	Reconciled bool `json:"reconciled,omitempty"`
 	// SourceResumed: RESUME SOURCE confirmed apps are back on the source
 	// after a rollback. Finalized: FINALIZE closed a restored plan.
-	SourceResumed bool      `json:"sourceResumed,omitempty"`
-	Finalized     bool      `json:"finalized,omitempty"`
-	CreatedAt     time.Time `json:"createdAt"`
-	UpdatedAt     time.Time `json:"updatedAt"`
+	SourceResumed         bool       `json:"sourceResumed,omitempty"`
+	Finalized             bool       `json:"finalized,omitempty"`
+	InitialCopyObservedAt *time.Time `json:"initialCopyObservedAt,omitempty"`
+	ForwardObservedAt     *time.Time `json:"forwardObservedAt,omitempty"`
+	ReverseObservedAt     *time.Time `json:"reverseObservedAt,omitempty"`
+	LastSuccessfulSyncAt  *time.Time `json:"lastSuccessfulSyncAt,omitempty"`
+	LastVerificationAt    *time.Time `json:"lastVerificationAt,omitempty"`
+	LastProgressAt        *time.Time `json:"lastProgressAt,omitempty"`
+	CreatedAt             time.Time  `json:"createdAt"`
+	UpdatedAt             time.Time  `json:"updatedAt"`
 }
 
 var (

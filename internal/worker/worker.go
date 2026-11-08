@@ -17,9 +17,12 @@ import (
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/migration"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/routing"
 	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/store"
+	"github.com/SoftBank-2026-Hackathon-Foxtrot/object-migration/internal/telemetry"
 )
 
 type Config struct {
+	Telemetry *telemetry.Telemetry
+	Observe   func(context.Context, migration.Migration)
 	// PollInterval is how often a migration rechecks its state while it
 	// waits, and how often the worker looks for migrations it is not running.
 	PollInterval time.Duration
@@ -235,7 +238,22 @@ func (w *Worker) loop(ctx context.Context, id string, wake <-chan struct{}) {
 }
 
 // step does one unit of work and returns how long to wait before the next.
-func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration, error) {
+func (w *Worker) step(ctx context.Context, m migration.Migration) (wait time.Duration, err error) {
+	if w.cfg.Telemetry != nil && m.Plan != nil {
+		action := string(m.Phase)
+		var parent map[string]string
+		if m.Pending != nil {
+			action = string(m.Pending.Command)
+			parent = m.Pending.TraceContext
+		}
+		var end func(error)
+		ctx, end = w.cfg.Telemetry.Operation(ctx, m.Plan.WorkflowID, m.ID, m.ActiveOperation, action, parent)
+		defer func() { end(err) }()
+	}
+	return w.stepWork(ctx, m)
+}
+
+func (w *Worker) stepWork(ctx context.Context, m migration.Migration) (time.Duration, error) {
 	if m.Pending != nil {
 		return 0, w.runCommand(ctx, m)
 	}
@@ -258,6 +276,12 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 		defer done()
 		report := func(p migration.Progress) {
 			err := w.mutate(ctx, m.ID, func(x *migration.Migration) error {
+				if p.Completed > x.Replication.InitialCopy.Completed || p.Bytes > x.Replication.InitialCopy.Bytes {
+					at := w.now().UTC()
+					x.LastProgressAt = &at
+				}
+				at := w.now().UTC()
+				x.InitialCopyObservedAt = &at
 				x.Replication.InitialCopy = p
 				return nil
 			})
@@ -295,6 +319,12 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 			if x.Phase != migration.PhaseSyncing && x.Phase != migration.PhaseReady {
 				return nil // a command moved it on while we synced
 			}
+			at := w.now().UTC()
+			x.LastSuccessfulSyncAt, x.LastVerificationAt = &at, &at
+			x.ForwardObservedAt = &at
+			if report.Backlog < x.Replication.Forward.Backlog {
+				x.LastProgressAt = &at
+			}
 			x.Readiness.Cutover, x.LastError = report.Cutover, nil
 			x.Replication.Forward.Backlog = report.Backlog
 			x.Replication.Forward.LagSeconds = report.LagSeconds
@@ -328,6 +358,12 @@ func (w *Worker) step(ctx context.Context, m migration.Migration) (time.Duration
 		err = w.mutate(ctx, m.ID, func(x *migration.Migration) error {
 			if x.Phase != migration.PhaseVerifying {
 				return nil
+			}
+			at := w.now().UTC()
+			x.LastSuccessfulSyncAt, x.LastVerificationAt = &at, &at
+			x.ReverseObservedAt = &at
+			if report.ReverseBacklog < x.Replication.Reverse.Backlog {
+				x.LastProgressAt = &at
 			}
 			x.Readiness.Advance, x.Readiness.Rollback, x.LastError = report.Advance, report.Rollback, nil
 			x.Replication.Reverse.Backlog = report.ReverseBacklog
@@ -683,8 +719,12 @@ func (w *Worker) mutate(ctx context.Context, id string, fn func(*migration.Migra
 			return err
 		}
 		m.UpdatedAt = w.now()
-		_, err = w.store.Update(ctx, m)
+		saved, updateErr := w.store.Update(ctx, m)
+		err = updateErr
 		if err == nil {
+			if w.cfg.Observe != nil {
+				w.cfg.Observe(ctx, saved)
+			}
 			return nil
 		}
 		if !errors.Is(err, store.ErrConflict) {
